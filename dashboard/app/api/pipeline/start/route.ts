@@ -40,14 +40,28 @@ export async function POST() {
   child.unref();
   fs.closeSync(logFd);
 
-  // Write initial state (Python will overwrite with pid from its own process)
+  // Write a fully-clean initial state. Explicitly null out any field that may
+  // have been left over from a previous failed/done/aborted run, so the
+  // dashboard never shows stale info during the brief window before Python's
+  // first write_state() call.
   const initial = {
-    status: "running",
-    current_step: "Starting pipeline...",
-    started_at: new Date().toISOString(),
-    updated_at: new Date().toISOString(),
-    finished_at: null,
-    pid: child.pid,
+    status:        "running",
+    current_step:  "Starting pipeline...",
+    started_at:    new Date().toISOString(),
+    updated_at:    new Date().toISOString(),
+    finished_at:   null,
+    pid:           child.pid,
+    // ── Explicitly cleared from any previous run ──────────────
+    error_type:        null,
+    error_message:     null,
+    error_traceback:   null,
+    summary:           null,
+    aborted_at:        null,
+    abort_pod_result:  null,
+    abort_proc_result: null,
+    pod_id:            null,
+    pod_ip:            null,
+    pod_port:          null,
   };
   fs.writeFileSync(STATE, JSON.stringify(initial, null, 2));
 

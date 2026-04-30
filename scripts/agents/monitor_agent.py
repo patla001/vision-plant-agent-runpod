@@ -10,6 +10,7 @@ from pathlib import Path
 import anthropic
 
 from base_agent import run_agent_loop
+from _constants import MONITOR_MODEL, MONITOR_MAX_ITERATIONS, SSH_CONNECT_TIMEOUT
 
 _SYSTEM = """You are the Monitor Agent for the CS659 CNN training pipeline.
 Your job is to check the current status of a CNN training job running on a remote RunPod GPU pod.
@@ -68,7 +69,7 @@ _TOOLS = [
 ]
 
 
-def _ssh_run(ip: str, port: int, cmd: str, timeout: int = 20) -> str:
+def _ssh_run(ip: str, port: int, cmd: str, timeout: int = SSH_CONNECT_TIMEOUT) -> str:
     result = subprocess.run(
         ["ssh", "-p", str(port), "-o", "StrictHostKeyChecking=no",
          "-o", f"ConnectTimeout={timeout}", f"root@{ip}", cmd],
@@ -106,6 +107,6 @@ def run(client: anthropic.Anthropic, pod_ip: str, pod_port: int) -> str:
             "Report: training DONE/IN_PROGRESS/FAILED, latest epoch metrics if available."
         ),
         tool_executor=_execute_tool,
-        model="claude-haiku-4-5",   # simple status check → cheapest model
-        max_iterations=10,
+        model=MONITOR_MODEL,
+        max_iterations=MONITOR_MAX_ITERATIONS,
     )

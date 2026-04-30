@@ -9,6 +9,10 @@ import Diagnostics from "./Diagnostics";
 const HeroScene   = dynamic(() => import("./HeroScene"),   { ssr: false });
 const TrainingOrb = dynamic(() => import("./TrainingOrb"), { ssr: false });
 
+// How often (ms) to refresh /api/pipeline/status while the pipeline is running.
+// 10 s is a balance between dashboard responsiveness and server load.
+const POLL_INTERVAL_MS = 10_000;
+
 interface Issue {
   type: "error" | "warning";
   lineNumber: number;
@@ -62,7 +66,7 @@ export default function PipelineControl({ initialState, onResultsReady }: Props)
       const data: State = await fetch("/api/pipeline/status").then((r) => r.json());
       setState(data);
       if (data.status === "done" && data.hasResults) onResultsReady();
-    }, 10_000);
+    }, POLL_INTERVAL_MS);
     return () => clearInterval(id);
   }, [state.status, onResultsReady]);
 

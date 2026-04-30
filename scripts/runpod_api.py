@@ -2,9 +2,20 @@
 from __future__ import annotations
 
 import os
+import sys
 import time
 import socket
 import requests
+
+# Allow `from _constants import ...` when this module is imported via the agent path
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "agents"))
+from _constants import (
+    DEFAULT_GPU_TYPE,
+    DEFAULT_DISK_GB,
+    POD_DOCKER_IMAGE,
+    POD_READY_TIMEOUT_SEC,
+    RUNPOD_API_TIMEOUT,
+)
 
 _GQL = "https://api.runpod.io/graphql"
 
@@ -16,7 +27,7 @@ def _call(query: str, variables: dict | None = None) -> dict:
     resp = requests.post(
         f"{_GQL}?api_key={key}",
         json={"query": query, "variables": variables or {}},
-        timeout=30,
+        timeout=RUNPOD_API_TIMEOUT,
     )
     resp.raise_for_status()
     body = resp.json()
@@ -27,8 +38,8 @@ def _call(query: str, variables: dict | None = None) -> dict:
 
 def create_pod(
     name: str,
-    gpu_type: str = "NVIDIA GeForce RTX 4090",
-    disk_gb: int = 150,
+    gpu_type: str = DEFAULT_GPU_TYPE,
+    disk_gb: int = DEFAULT_DISK_GB,
 ) -> str:
     """Create an on-demand pod. Returns pod_id."""
     data = _call(
@@ -40,7 +51,7 @@ def create_pod(
         {
             "input": {
                 "name": name,
-                "imageName": "runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04",
+                "imageName": POD_DOCKER_IMAGE,
                 "gpuTypeId": gpu_type,
                 "cloudType": "SECURE",
                 "gpuCount": 1,
@@ -80,7 +91,7 @@ def get_ssh_endpoint(pod_id: str) -> tuple[str, int] | tuple[None, None]:
     return None, None
 
 
-def wait_for_pod(pod_id: str, timeout: int = 600) -> tuple[str, int]:
+def wait_for_pod(pod_id: str, timeout: int = POD_READY_TIMEOUT_SEC) -> tuple[str, int]:
     """Block until SSH port is reachable. Returns (ip, port)."""
     deadline = time.time() + timeout
     while time.time() < deadline:

@@ -87,7 +87,7 @@ export default function TrainingOrb({ className = "" }: { className?: string }) 
       }
       const ring2Geo = new THREE.BufferGeometry();
       ring2Geo.setAttribute("position", new THREE.BufferAttribute(ring2Pos, 3));
-      ring2Geo.setAttribute("color",    new THREE.BufferAttribute(ringCol));
+      ring2Geo.setAttribute("color",    new THREE.BufferAttribute(ringCol, 3));
       const ring2 = new THREE.Points(ring2Geo, new THREE.PointsMaterial({
         size: 2.5, vertexColors: true, transparent: true, opacity: .5, sizeAttenuation: true,
       }));

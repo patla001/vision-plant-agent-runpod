@@ -20,6 +20,7 @@ import json
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import anthropic
@@ -29,6 +30,22 @@ sys.path.insert(0, str(Path(__file__).parent))
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from pipeline_state import write_state
+from _constants import (
+    ORCHESTRATOR_MODEL,
+    ORCHESTRATOR_MAX_ITERATIONS,
+    POD_NAME,
+    DEFAULT_GPU_TYPE,
+    DEFAULT_DISK_GB,
+    DEFAULT_WAIT_MINUTES,
+)
+
+
+@dataclass
+class PipelineContext:
+    """Mutable state shared between the orchestrator and its tool executor."""
+    pod_id:   str | None = None
+    pod_ip:   str | None = None
+    pod_port: int | None = None
 
 import monitor_agent
 import analysis_agent
@@ -160,21 +177,22 @@ def _ssh(ip: str, port: int, cmd: str) -> str:
     return (r.stdout + r.stderr).strip()
 
 
-def make_tool_executor(client: anthropic.Anthropic, pod_id_ref: list) -> callable:
+def make_tool_executor(client: anthropic.Anthropic, ctx: PipelineContext) -> callable:
     """
-    Returns a tool executor closure that captures client and a mutable pod_id_ref.
-    pod_id_ref[0] is updated when provision_pod runs so terminate_pod can use it.
+    Returns a tool executor closure that captures the client and a shared
+    PipelineContext. The orchestrator's tools update ctx.pod_id / pod_ip /
+    pod_port so later tools (terminate_pod, abort handler) can read them.
     """
 
     def execute(name: str, inputs: dict) -> str:
         if name == "provision_pod":
             write_state("running", "Provisioning RTX 4090 GPU pod on RunPod...")
             pod_id = runpod_api.create_pod(
-                name="cs659-cnn-training",
-                gpu_type="NVIDIA GeForce RTX 4090",
-                disk_gb=150,
+                name=POD_NAME,
+                gpu_type=DEFAULT_GPU_TYPE,
+                disk_gb=DEFAULT_DISK_GB,
             )
-            pod_id_ref[0] = pod_id
+            ctx.pod_id = pod_id
             write_state("running", f"Pod created: {pod_id}", pod_id=pod_id)
             return json.dumps({"pod_id": pod_id})
 
@@ -182,6 +200,8 @@ def make_tool_executor(client: anthropic.Anthropic, pod_id_ref: list) -> callabl
             write_state("running", "Waiting for pod SSH to become available...")
             pod_id = inputs["pod_id"]
             ip, port = runpod_api.wait_for_pod(pod_id)
+            ctx.pod_ip = ip
+            ctx.pod_port = port
             write_state("running", f"Pod ready — SSH: {ip}:{port}", pod_ip=ip, pod_port=port)
             return json.dumps({"ip": ip, "port": port})
 
@@ -203,7 +223,7 @@ def make_tool_executor(client: anthropic.Anthropic, pod_id_ref: list) -> callabl
             return report
 
         if name == "wait_minutes":
-            minutes = inputs.get("minutes", 5)
+            minutes = inputs.get("minutes", DEFAULT_WAIT_MINUTES)
             write_state("running", f"CNN training in progress — next check in {minutes} min...")
             time.sleep(int(minutes) * 60)
             return f"Waited {minutes} minutes."
@@ -231,7 +251,7 @@ def make_tool_executor(client: anthropic.Anthropic, pod_id_ref: list) -> callabl
 
         if name == "terminate_pod":
             write_state("running", "Terminating pod — stopping billing...")
-            pod_id = inputs.get("pod_id") or pod_id_ref[0]
+            pod_id = inputs.get("pod_id") or ctx.pod_id
             if not pod_id:
                 return "Error: no pod_id available."
             runpod_api.terminate_pod(pod_id)
@@ -252,7 +272,7 @@ def make_tool_executor(client: anthropic.Anthropic, pod_id_ref: list) -> callabl
 
 def run(client: anthropic.Anthropic) -> str:
     """Run the full orchestrator pipeline. Returns the final summary."""
-    pod_id_ref: list = [None]   # mutable reference so tool executor can share pod_id
+    ctx = PipelineContext()
 
     return run_agent_loop(
         client=client,
@@ -263,15 +283,12 @@ def run(client: anthropic.Anthropic) -> str:
             "Run the complete CS659 CNN training pipeline:\n"
             "1. Provision a RunPod RTX 4090 pod\n"
             "2. Launch CNN training on PlantNet-300K (wget → flatten → train)\n"
-            "3. Monitor training every 5 minutes until done\n"
+            f"3. Monitor training every {DEFAULT_WAIT_MINUTES} minutes until done\n"
             "4. Download results and terminate the pod\n"
             "5. Analyze results and return a final summary\n"
             "Proceed autonomously. Remember to ALWAYS terminate the pod."
         ),
-        tool_executor=make_tool_executor(client, pod_id_ref),
-        model="claude-opus-4-7",
-        # Long pipeline: provision (1) + wait_ssh (1) + launch (1) + N×{monitor + wait_minutes}
-        # + download (1) + terminate (1) + analyze (1) = 6 + 2N. For 4-hour training
-        # with 5-min polls, N≈48, so 6 + 96 = 102 iterations. 200 leaves headroom.
-        max_iterations=200,
+        tool_executor=make_tool_executor(client, ctx),
+        model=ORCHESTRATOR_MODEL,
+        max_iterations=ORCHESTRATOR_MAX_ITERATIONS,
     )

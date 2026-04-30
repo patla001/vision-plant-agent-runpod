@@ -23,10 +23,20 @@ function readText(p: string): string {
   try { return fs.readFileSync(p, "utf8"); } catch { return ""; }
 }
 
+// Cache parsed CSV by file path + mtime. The dashboard hits this endpoint
+// every time the user lands on the results page, but the CSV only changes
+// once per training run. Re-parsing tens of KB on every navigation is wasteful.
+const _csvCache = new Map<string, { mtimeMs: number; rows: Record<string, string>[] }>();
+
 function parseCsv(p: string): Record<string, string>[] {
   try {
-    const text = fs.readFileSync(p, "utf8");
+    const stat   = fs.statSync(p);
+    const cached = _csvCache.get(p);
+    if (cached && cached.mtimeMs === stat.mtimeMs) return cached.rows;
+
+    const text   = fs.readFileSync(p, "utf8");
     const result = Papa.parse<Record<string, string>>(text, { header: true, skipEmptyLines: true });
+    _csvCache.set(p, { mtimeMs: stat.mtimeMs, rows: result.data });
     return result.data;
   } catch { return []; }
 }

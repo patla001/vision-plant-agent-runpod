@@ -5,13 +5,27 @@ import { useEffect, useMemo, useRef, useState } from "react";
 interface Props { initialLines: string[] }
 type Filter = "all" | "errors" | "warnings";
 
-const ERROR_RE   = /\b(ERROR|Error|Traceback|Exception|FAILED|failed)\b/;
-const WARNING_RE = /\b(WARN|WARNING|Warning|warning)\b/;
+const ERROR_RE       = /\b(ERROR|Error|Traceback|Exception|FAILED|failed)\b/;
+const WARNING_RE     = /\b(WARN|WARNING|Warning|warning)\b/;
+const FILTER_STORAGE_KEY = "liveLog.filter";
+
+function readStoredFilter(): Filter {
+  if (typeof window === "undefined") return "all";
+  const v = window.localStorage.getItem(FILTER_STORAGE_KEY);
+  return v === "errors" || v === "warnings" ? v : "all";
+}
 
 export default function LiveLog({ initialLines }: Props) {
   const [lines, setLines]   = useState<string[]>(initialLines);
-  const [filter, setFilter] = useState<Filter>("all");
+  const [filter, setFilter] = useState<Filter>(readStoredFilter);
   const bottomRef = useRef<HTMLDivElement>(null);
+
+  // Persist filter choice across page reloads
+  useEffect(() => {
+    if (typeof window !== "undefined") {
+      window.localStorage.setItem(FILTER_STORAGE_KEY, filter);
+    }
+  }, [filter]);
 
   useEffect(() => {
     const es = new EventSource("/api/pipeline/logs");

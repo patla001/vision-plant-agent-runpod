@@ -10,6 +10,7 @@ from pathlib import Path
 import anthropic
 
 from base_agent import run_agent_loop
+from _constants import ANALYSIS_MODEL, ANALYSIS_MAX_ITERATIONS
 
 _SYSTEM = """You are the Analysis Agent for the CS659 CNN plant-classification project.
 Your job is to read the downloaded training results and produce a clear, insightful report.
@@ -134,6 +135,6 @@ def run(client: anthropic.Anthropic) -> str:
             "and produce a complete analysis report. Save it with save_analysis_report."
         ),
         tool_executor=_execute_tool,
-        model="claude-opus-4-7",   # deep analysis → most capable model
-        max_iterations=15,
+        model=ANALYSIS_MODEL,
+        max_iterations=ANALYSIS_MAX_ITERATIONS,
     )

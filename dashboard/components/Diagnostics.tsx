@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
 interface Issue {
   type: "error" | "warning";
@@ -14,9 +14,33 @@ interface Props {
   warnings: Issue[];
 }
 
+const OPEN_KEY = "diagnostics.open";
+const TAB_KEY  = "diagnostics.tab";
+
+function readOpen(): boolean {
+  if (typeof window === "undefined") return true;
+  return window.localStorage.getItem(OPEN_KEY) !== "false";
+}
+
+function readTab(fallback: "errors" | "warnings"): "errors" | "warnings" {
+  if (typeof window === "undefined") return fallback;
+  const v = window.localStorage.getItem(TAB_KEY);
+  return v === "errors" || v === "warnings" ? v : fallback;
+}
+
 export default function Diagnostics({ errors, warnings }: Props) {
-  const [open, setOpen]   = useState(true);
-  const [tab, setTab]     = useState<"errors" | "warnings">(errors.length ? "errors" : "warnings");
+  const [open, setOpen] = useState(readOpen);
+  const [tab, setTab]   = useState<"errors" | "warnings">(() =>
+    readTab(errors.length ? "errors" : "warnings")
+  );
+
+  // Persist user's preferences across reloads
+  useEffect(() => {
+    if (typeof window !== "undefined") window.localStorage.setItem(OPEN_KEY, String(open));
+  }, [open]);
+  useEffect(() => {
+    if (typeof window !== "undefined") window.localStorage.setItem(TAB_KEY, tab);
+  }, [tab]);
 
   const issues = tab === "errors" ? errors : warnings;
   const hasAny = errors.length > 0 || warnings.length > 0;
