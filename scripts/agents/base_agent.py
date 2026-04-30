@@ -23,7 +23,21 @@ def run_agent_loop(
     Standard agentic loop with prompt caching.
     Runs until stop_reason == 'end_turn' or max_iterations is reached.
     Returns the final text response.
+
+    Adaptive thinking is enabled only for Opus 4.x and Sonnet 4.6 models.
+    Haiku models reject `thinking` with HTTP 400 ("adaptive thinking is not
+    supported on this model"), so we omit the parameter entirely for them.
     """
+    # Detect models that support adaptive thinking. As of 2026-04, this is
+    # Opus 4.6, Opus 4.7, and Sonnet 4.6. Haiku 4.5 does NOT support it.
+    supports_adaptive = (
+        model.startswith("claude-opus-4-")
+        or model.startswith("claude-sonnet-4-6")
+    )
+    extra_kwargs: dict = {}
+    if supports_adaptive:
+        extra_kwargs["thinking"] = {"type": "adaptive"}
+
     messages: list[dict] = [{"role": "user", "content": initial_message}]
 
     for iteration in range(max_iterations):
@@ -32,7 +46,6 @@ def run_agent_loop(
         response = client.messages.create(
             model=model,
             max_tokens=16000,
-            thinking={"type": "adaptive"},
             system=[
                 {
                     "type": "text",
@@ -43,6 +56,7 @@ def run_agent_loop(
             ],
             tools=tools,
             messages=messages,
+            **extra_kwargs,
         )
 
         # Append full assistant response (includes tool_use blocks if any)
