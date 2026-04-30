@@ -218,7 +218,7 @@ secrets/
 
 # ── RunPod / training pipeline ────────────────────────────────
 scripts/pod_info.json
-results/
+/results/
 pipeline.log
 
 # ── Large ML artifacts ────────────────────────────────────────
@@ -277,7 +277,7 @@ Thumbs.db
 
 # ── Logs ─────────────────────────────────────────────────────
 *.log
-logs/
+/logs/
 npm-debug.log*
 pnpm-debug.log*
 
