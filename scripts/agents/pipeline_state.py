@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import json
 import os
+import sys
+import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -41,3 +43,22 @@ def write_state(status: str, step: str, **extra: object) -> None:
     tmp = STATE_FILE.with_suffix(".tmp")
     tmp.write_text(json.dumps(existing, indent=2) + "\n")
     tmp.replace(STATE_FILE)
+
+
+def write_error(message: str, exception: BaseException | None = None) -> None:
+    """
+    Write a 'failed' state with rich error info: exception class, message,
+    full traceback. The dashboard renders these in the failed-state UI.
+    Also prints the traceback to stderr so it lands in pipeline.log.
+    """
+    extra: dict = {"error_message": str(exception) if exception else message}
+    if exception is not None:
+        extra["error_type"]      = type(exception).__name__
+        extra["error_traceback"] = traceback.format_exc()
+        # Echo to stderr so the formatted traceback appears in pipeline.log
+        print("=" * 60, file=sys.stderr, flush=True)
+        print(f"PIPELINE ERROR: {extra['error_type']}: {extra['error_message']}",
+              file=sys.stderr, flush=True)
+        print(extra["error_traceback"], file=sys.stderr, flush=True)
+        print("=" * 60, file=sys.stderr, flush=True)
+    write_state("failed", message, **extra)

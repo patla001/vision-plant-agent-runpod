@@ -73,11 +73,14 @@ def run_agent_loop(
                         "content": str(result),
                     })
                 except Exception as exc:
-                    _log(agent_name, f"Tool error: {exc}")
+                    import traceback
+                    tb = traceback.format_exc()
+                    _log(agent_name, f"ERROR in tool '{block.name}': {type(exc).__name__}: {exc}")
+                    print(tb, flush=True)   # full stack to log file for dashboard
                     tool_results.append({
                         "type": "tool_result",
                         "tool_use_id": block.id,
-                        "content": f"Error: {exc}",
+                        "content": f"Error ({type(exc).__name__}): {exc}\n\n{tb}",
                         "is_error": True,
                     })
 

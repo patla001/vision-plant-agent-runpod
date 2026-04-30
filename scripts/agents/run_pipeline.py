@@ -40,7 +40,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import orchestrator
-from pipeline_state import write_state
+from pipeline_state import write_state, write_error
 
 
 def main() -> None:
@@ -61,8 +61,7 @@ def main() -> None:
         print("=" * 60)
         print(summary)
     except Exception as exc:
-        write_state("failed", f"Pipeline failed: {exc}")
-        print(f"\n[ERROR] Pipeline failed: {exc}")
+        write_error(f"Pipeline failed: {exc}", exception=exc)
         raise
 
 

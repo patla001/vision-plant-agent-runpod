@@ -4,9 +4,17 @@ import { useCallback, useEffect, useState } from "react";
 import dynamic from "next/dynamic";
 import PipelineSteps from "./PipelineSteps";
 import LiveLog from "./LiveLog";
+import Diagnostics from "./Diagnostics";
 
 const HeroScene   = dynamic(() => import("./HeroScene"),   { ssr: false });
 const TrainingOrb = dynamic(() => import("./TrainingOrb"), { ssr: false });
+
+interface Issue {
+  type: "error" | "warning";
+  lineNumber: number;
+  text: string;
+  context: string[];
+}
 
 interface State {
   status: string;
@@ -17,6 +25,11 @@ interface State {
   hasResults?: boolean;
   summary?: string;
   error?: string;
+  errors?: Issue[];
+  warnings?: Issue[];
+  error_type?: string;
+  error_message?: string;
+  error_traceback?: string;
 }
 
 interface Props {
@@ -204,6 +217,9 @@ export default function PipelineControl({ initialState, onResultsReady }: Props)
           </div>
         )}
 
+        {/* Diagnostics — error/warning summary with expandable context */}
+        <Diagnostics errors={state.errors ?? []} warnings={state.warnings ?? []} />
+
         {/* Live log */}
         <LiveLog initialLines={state.logLines ?? []} />
 
@@ -220,17 +236,46 @@ export default function PipelineControl({ initialState, onResultsReady }: Props)
   if (state.status === "failed") {
     return (
       <div className="space-y-6 animate-float-up">
+        {/* Header banner */}
         <div className="relative overflow-hidden glass rounded-2xl px-5 py-5 border border-red-500/30">
           <div className="absolute inset-0 bg-gradient-to-r from-red-500/5 to-transparent pointer-events-none" />
           <div className="flex items-start gap-4">
             <span className="text-2xl">💥</span>
-            <div>
+            <div className="flex-1 min-w-0">
               <p className="font-bold text-red-300 text-base">Pipeline failed</p>
-              <p className="text-sm text-red-400/80 mt-1">{state.current_step}</p>
+              {state.error_type ? (
+                <p className="text-sm mt-1">
+                  <span className="font-mono text-red-400 font-semibold">{state.error_type}</span>
+                  <span className="text-red-400/80">: {state.error_message}</span>
+                </p>
+              ) : (
+                <p className="text-sm text-red-400/80 mt-1">{state.current_step}</p>
+              )}
             </div>
           </div>
         </div>
 
+        {/* Diagnostics — error/warning summary */}
+        <Diagnostics errors={state.errors ?? []} warnings={state.warnings ?? []} />
+
+        {/* Python traceback (if captured) */}
+        {state.error_traceback && (
+          <div className="terminal">
+            <div className="terminal-bar px-4 py-2.5 flex items-center gap-2">
+              <div className="flex gap-1.5">
+                <span className="w-3 h-3 rounded-full bg-red-500" />
+                <span className="w-3 h-3 rounded-full bg-amber-500/50" />
+                <span className="w-3 h-3 rounded-full bg-green-500/50" />
+              </div>
+              <span className="text-xs text-slate-500 font-mono ml-2">python traceback</span>
+            </div>
+            <pre className="p-4 font-mono text-[11px] text-red-300/90 max-h-80 overflow-auto whitespace-pre leading-relaxed">
+              {state.error_traceback}
+            </pre>
+          </div>
+        )}
+
+        {/* Last log lines (always show as fallback) */}
         <div className="terminal">
           <div className="terminal-bar px-4 py-2.5 flex items-center gap-2">
             <div className="flex gap-1.5">
@@ -238,21 +283,32 @@ export default function PipelineControl({ initialState, onResultsReady }: Props)
               <span className="w-3 h-3 rounded-full bg-amber-500/50" />
               <span className="w-3 h-3 rounded-full bg-green-500/50" />
             </div>
-            <span className="text-xs text-slate-500 font-mono ml-2">error output</span>
+            <span className="text-xs text-slate-500 font-mono ml-2">last 50 lines · pipeline.log</span>
           </div>
-          <div className="p-4 font-mono text-xs text-red-400/90 max-h-64 overflow-y-auto space-y-0.5">
-            {(state.logLines ?? []).slice(-50).map((l, i) => (
-              <div key={i} className="whitespace-pre-wrap break-all">{l}</div>
-            ))}
+          <div className="p-4 font-mono text-xs max-h-64 overflow-y-auto space-y-0.5">
+            {(state.logLines ?? []).slice(-50).map((l, i) => {
+              const isError = /\b(ERROR|Error|Traceback|Exception|FAILED|failed)\b/.test(l);
+              const isWarn  = !isError && /\b(WARN|WARNING|Warning|warning)\b/.test(l);
+              const c = isError ? "text-red-400" : isWarn ? "text-amber-400" : "text-slate-400";
+              return <div key={i} className={`${c} whitespace-pre-wrap break-all`}>{l}</div>;
+            })}
           </div>
         </div>
 
-        <button
-          onClick={handleRetry}
-          className="px-6 py-2.5 bg-gradient-to-r from-red-600 to-red-700 hover:from-red-500 hover:to-red-600 rounded-xl text-sm font-semibold transition-all shadow-lg"
-        >
-          🔄 Retry Pipeline
-        </button>
+        <div className="flex gap-3">
+          <button
+            onClick={handleRetry}
+            className="px-6 py-2.5 bg-gradient-to-r from-red-600 to-red-700 hover:from-red-500 hover:to-red-600 rounded-xl text-sm font-semibold transition-all shadow-lg"
+          >
+            🔄 Retry Pipeline
+          </button>
+          <button
+            onClick={() => navigator.clipboard.writeText(state.error_traceback ?? state.current_step ?? "")}
+            className="px-5 py-2.5 glass border border-white/10 hover:border-white/20 rounded-xl text-sm font-medium text-slate-300 transition-all"
+          >
+            📋 Copy error
+          </button>
+        </div>
       </div>
     );
   }
