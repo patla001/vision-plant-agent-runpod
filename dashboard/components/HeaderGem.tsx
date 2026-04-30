@@ -8,9 +8,11 @@ export default function HeaderGem({ size = 32 }: { size?: number }) {
   useEffect(() => {
     let animId: number;
     let cleanup: (() => void) | undefined;
+    let aborted = false;   // race guard: component may unmount during await
 
     (async () => {
       const THREE = await import("three");
+      if (aborted) return;
       const el = mountRef.current;
       if (!el) return;
 
@@ -54,7 +56,10 @@ export default function HeaderGem({ size = 32 }: { size?: number }) {
       };
     })();
 
-    return () => cleanup?.();
+    return () => {
+      aborted = true;
+      cleanup?.();
+    };
   }, [size]);
 
   return <div ref={mountRef} style={{ width: size, height: size, flexShrink: 0 }} />;

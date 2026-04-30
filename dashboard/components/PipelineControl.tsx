@@ -9,6 +9,10 @@ import Diagnostics from "./Diagnostics";
 const HeroScene   = dynamic(() => import("./HeroScene"),   { ssr: false });
 const TrainingOrb = dynamic(() => import("./TrainingOrb"), { ssr: false });
 
+// RTX 4090 on RunPod is currently ~$0.74/hr (as of Apr 2026).
+// This is a rough estimate — real billing happens on RunPod's side.
+const GPU_HOURLY_RATE = 0.74;
+
 interface Issue {
   type: "error" | "warning";
   lineNumber: number;
@@ -218,10 +222,11 @@ export default function PipelineControl({ initialState, onResultsReady }: Props)
         </div>{/* end orb+banner row */}
 
         {/* Info row */}
-        <div className="grid grid-cols-3 gap-3">
-          <StatBadge label="Elapsed"     value={`${elapsed} min`}                  color="cyan" />
-          <StatBadge label="GPU"         value="RTX 4090"                           color="purple" />
-          <StatBadge label="Status"      value="Running"                            color="green" />
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+          <StatBadge label="Elapsed"  value={`${elapsed} min`}                                 color="cyan" />
+          <StatBadge label="GPU"      value="RTX 4090"                                          color="purple" />
+          <StatBadge label="Est. Cost" value={`$${((elapsed / 60) * GPU_HOURLY_RATE).toFixed(2)}`} color="green" />
+          <StatBadge label="Status"   value="Running"                                           color="cyan" />
         </div>
 
         {/* Step progress */}
