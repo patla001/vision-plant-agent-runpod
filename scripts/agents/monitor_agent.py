@@ -14,17 +14,26 @@ from base_agent import run_agent_loop
 _SYSTEM = """You are the Monitor Agent for the CS659 CNN training pipeline.
 Your job is to check the current status of a CNN training job running on a remote RunPod GPU pod.
 
-You have three SSH-based tools:
-- check_done_sentinel: Check if the DONE file exists (training finished)
-- tail_training_log:   Read the last lines of the training log
-- check_screen_session: Verify the screen session is still running
+The pod goes through TWO phases:
+  1. SETUP   — pod_setup.sh runs wget (31.7 GB dataset), unzip, pip install, flatten symlinks.
+               Progress logged to /workspace/setup.log. Runs in screen session 'pod_setup'.
+               Takes ~15 minutes.
+  2. TRAINING — train_cnn screen session runs the CNN. Logs to /workspace/results/training.log.
+               DONE sentinel written when complete.
+
+You have these SSH-based tools:
+- check_done_sentinel: Check if /workspace/DONE exists (training finished)
+- tail_training_log:   Read last lines of /workspace/results/training.log (TRAINING phase)
+- tail_setup_log:      Read last lines of /workspace/setup.log (SETUP phase)
+- check_screen_session: Verify pod_setup or train_cnn screen sessions are running
 
 Steps:
-1. Check if the DONE sentinel file exists.
-2. If DONE exists, read its contents and report the final status.
-3. If DONE does not exist, tail the training log to see the latest epoch metrics.
-4. Check if the screen session is still alive.
-5. Return a clear status report: DONE/IN_PROGRESS/FAILED + key metrics if available.
+1. Check if DONE sentinel exists. If yes, training is complete — report DONE + status.
+2. Check screen sessions to determine which phase we're in:
+   - Only 'pod_setup' alive → still in SETUP phase, tail setup.log
+   - Only 'train_cnn' alive → in TRAINING phase, tail training.log
+   - Both dead and no DONE → something failed, report FAILED with last log lines
+3. Return a clear status report: DONE / SETUP_IN_PROGRESS / TRAINING_IN_PROGRESS / FAILED.
 """
 
 _TOOLS = [
@@ -54,8 +63,21 @@ _TOOLS = [
         },
     },
     {
+        "name": "tail_setup_log",
+        "description": "Get the last N lines of the SETUP log (/workspace/setup.log) — wget/unzip/pip install/flatten progress.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "pod_ip":   {"type": "string"},
+                "pod_port": {"type": "integer"},
+                "n_lines":  {"type": "integer", "description": "Lines to tail (default 30)"},
+            },
+            "required": ["pod_ip", "pod_port"],
+        },
+    },
+    {
         "name": "check_screen_session",
-        "description": "Check if the 'train_cnn' screen session is still running on the pod.",
+        "description": "List all running screen sessions on the pod (pod_setup, train_cnn, or both).",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -87,6 +109,10 @@ def _execute_tool(name: str, inputs: dict) -> str:
     if name == "tail_training_log":
         n = inputs.get("n_lines", 60)
         return _ssh_run(ip, port, f"tail -n {n} /workspace/results/training.log 2>/dev/null || echo 'Log not found'")
+
+    if name == "tail_setup_log":
+        n = inputs.get("n_lines", 30)
+        return _ssh_run(ip, port, f"tail -n {n} /workspace/setup.log 2>/dev/null || echo 'Setup log not found'")
 
     if name == "check_screen_session":
         return _ssh_run(ip, port, "screen -list 2>&1")

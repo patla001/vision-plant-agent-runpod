@@ -190,9 +190,20 @@ def make_tool_executor(client: anthropic.Anthropic, pod_id_ref: list) -> callabl
             ip, port = inputs["pod_ip"], inputs["pod_port"]
             _scp(ip, port, SCRIPTS_DIR / "pod_setup.sh",           "/workspace/pod_setup.sh")
             _scp(ip, port, DL_DIR / "training_wrapper.py",         "/workspace/training_wrapper.py")
-            _ssh(ip, port, "chmod +x /workspace/pod_setup.sh && bash /workspace/pod_setup.sh")
-            write_state("running", "CNN training started in screen session on pod")
-            return "Training launched in screen session 'train_cnn'."
+            # pod_setup.sh runs wget (31.7 GB), unzip, pip install, flatten — total ~15 min.
+            # Run it inside a screen session so SSH returns immediately (otherwise the
+            # subprocess.run timeout kills it). Setup progress is logged to /workspace/setup.log
+            # which the MonitorAgent can tail.
+            _ssh(
+                ip, port,
+                "chmod +x /workspace/pod_setup.sh && "
+                "screen -dmS pod_setup bash -c "
+                "'/workspace/pod_setup.sh > /workspace/setup.log 2>&1'"
+            )
+            write_state("running", "Pod setup running in screen session (downloading 31.7 GB dataset)")
+            return ("Pod setup launched in screen session 'pod_setup'. "
+                    "Setup logs at /workspace/setup.log on pod. "
+                    "Training will start automatically when setup finishes (~15 min).")
 
         if name == "check_training_status":
             write_state("running", "Delegating to MonitorAgent — checking training status...")
