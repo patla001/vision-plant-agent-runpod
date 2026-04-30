@@ -270,5 +270,8 @@ def run(client: anthropic.Anthropic) -> str:
         ),
         tool_executor=make_tool_executor(client, pod_id_ref),
         model="claude-opus-4-7",
-        max_iterations=60,   # long pipeline — allow many monitor/wait cycles
+        # Long pipeline: provision (1) + wait_ssh (1) + launch (1) + N×{monitor + wait_minutes}
+        # + download (1) + terminate (1) + analyze (1) = 6 + 2N. For 4-hour training
+        # with 5-min polls, N≈48, so 6 + 96 = 102 iterations. 200 leaves headroom.
+        max_iterations=200,
     )
