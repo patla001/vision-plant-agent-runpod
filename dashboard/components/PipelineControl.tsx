@@ -87,6 +87,27 @@ export default function PipelineControl({ initialState, onResultsReady }: Props)
     await handleStart();
   }, [handleStart]);
 
+  const [aborting, setAborting] = useState(false);
+  const handleAbort = useCallback(async () => {
+    if (!confirm("Abort the running pipeline?\n\nThis will terminate the RunPod pod immediately (stopping billing) and kill the local Python process. Any in-progress training will be lost.")) {
+      return;
+    }
+    setAborting(true);
+    try {
+      const res  = await fetch("/api/pipeline/abort", { method: "POST" });
+      const data = await res.json();
+      if (!res.ok) {
+        alert(`Abort failed: ${data.error ?? "unknown error"}`);
+      }
+      const status: State = await fetch("/api/pipeline/status").then((r) => r.json());
+      setState(status);
+    } catch (e) {
+      alert(`Abort request failed: ${e}`);
+    } finally {
+      setAborting(false);
+    }
+  }, []);
+
   /* ── IDLE ──────────────────────────────────────────────────── */
   if (state.status === "idle") {
     return (
@@ -223,11 +244,33 @@ export default function PipelineControl({ initialState, onResultsReady }: Props)
         {/* Live log */}
         <LiveLog initialLines={state.logLines ?? []} />
 
-        {state.started_at && (
-          <p className="text-xs text-slate-600 text-right">
-            Started {new Date(state.started_at).toLocaleString()}
-          </p>
-        )}
+        <div className="flex items-center justify-between gap-3 pt-2">
+          {state.started_at ? (
+            <p className="text-xs text-slate-600">
+              Started {new Date(state.started_at).toLocaleString()}
+            </p>
+          ) : <span />}
+
+          {/* Abort button — terminates pod + kills local process */}
+          <button
+            onClick={handleAbort}
+            disabled={aborting}
+            className="px-4 py-2 rounded-lg text-xs font-semibold bg-red-500/10 hover:bg-red-500/20 border border-red-500/30 hover:border-red-500/50 text-red-300 transition-all disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1.5"
+            title="Terminate pod and kill the local Python process"
+          >
+            {aborting ? (
+              <>
+                <svg className="w-3 h-3 animate-spin" fill="none" viewBox="0 0 24 24">
+                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z" />
+                </svg>
+                Aborting…
+              </>
+            ) : (
+              <>⏹ Abort Pipeline</>
+            )}
+          </button>
+        </div>
       </div>
     );
   }

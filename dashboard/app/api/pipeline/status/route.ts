@@ -30,6 +30,24 @@ function readAllLines(filePath: string): string[] {
   return fs.readFileSync(filePath, "utf8").split("\n");
 }
 
+// ── Issue parse cache ────────────────────────────────────────
+// The status endpoint is polled every 10 s. Without this cache the entire
+// pipeline.log (potentially MB after a long run) gets re-parsed every poll.
+// We cache the parsed result keyed by file size — if the log hasn't grown
+// since the last parse, we return the cached value.
+let _issueCache: { size: number; mtime: number; errors: Issue[]; warnings: Issue[] } | null = null;
+
+function findIssuesCached(filePath: string): { errors: Issue[]; warnings: Issue[] } {
+  if (!fs.existsSync(filePath)) return { errors: [], warnings: [] };
+  const stat = fs.statSync(filePath);
+  if (_issueCache && _issueCache.size === stat.size && _issueCache.mtime === stat.mtimeMs) {
+    return { errors: _issueCache.errors, warnings: _issueCache.warnings };
+  }
+  const result = findIssues(readAllLines(filePath));
+  _issueCache = { size: stat.size, mtime: stat.mtimeMs, ...result };
+  return result;
+}
+
 function findIssues(allLines: string[]): { errors: Issue[]; warnings: Issue[] } {
   const errors:   Issue[] = [];
   const warnings: Issue[] = [];
@@ -70,7 +88,7 @@ export async function GET() {
   }
 
   const logLines = lastLines(LOG, 100);
-  const { errors, warnings } = findIssues(readAllLines(LOG));
+  const { errors, warnings } = findIssuesCached(LOG);
 
   return NextResponse.json({
     ...state,
