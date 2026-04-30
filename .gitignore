@@ -285,3 +285,4 @@ pnpm-debug.log*
 .venv/
 venv/
 .virtualenv/
+tsbuildinfo*

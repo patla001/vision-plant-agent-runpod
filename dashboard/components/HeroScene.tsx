@@ -13,9 +13,11 @@ export default function HeroScene({ className = "" }: { className?: string }) {
   useEffect(() => {
     let animId: number;
     let cleanup: (() => void) | undefined;
+    let aborted = false;   // race guard: component may unmount during await
 
     (async () => {
       const THREE = await import("three");
+      if (aborted) return;
       const el    = mountRef.current;
       if (!el) return;
 
@@ -143,7 +145,10 @@ export default function HeroScene({ className = "" }: { className?: string }) {
       };
     })();
 
-    return () => cleanup?.();
+    return () => {
+      aborted = true;
+      cleanup?.();
+    };
   }, []);
 
   return <div ref={mountRef} className={`absolute inset-0 ${className}`} />;

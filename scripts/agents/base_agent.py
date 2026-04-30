@@ -2,15 +2,11 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
 from typing import Any
 
 import anthropic
 
-
-def _log(agent_name: str, msg: str) -> None:
-    ts = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
-    print(f"[{ts}][{agent_name}] {msg}", flush=True)
+from _logging import log as _log
 
 
 def run_agent_loop(
