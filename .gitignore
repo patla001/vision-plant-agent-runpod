@@ -205,3 +205,83 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# ── Secrets & credentials ─────────────────────────────────────
+.env
+.env.*
+!.env.example
+secrets/
+*.key
+*.pem
+*.p12
+*.pfx
+
+# ── RunPod / training pipeline ────────────────────────────────
+scripts/pod_info.json
+results/
+pipeline.log
+
+# ── Large ML artifacts ────────────────────────────────────────
+*.tflite
+*.h5
+*.pb
+*.onnx
+*.joblib
+*.pkl
+*.pickle
+*.safetensors
+*.pt
+*.pth
+*.bin
+*.npz
+*.npy
+*.parquet
+
+# ── Datasets (never commit raw data) ─────────────────────────
+*.zip
+*.tar
+*.tar.gz
+*.tar.bz2
+*.7z
+data/
+datasets/
+plantnet*/
+plantnet_flat/
+
+# ── Next.js ──────────────────────────────────────────────────
+node_modules/
+dashboard/node_modules/
+dashboard/.next/
+dashboard/out/
+dashboard/.vercel/
+dashboard/.turbo/
+.npm/
+
+# ── macOS ────────────────────────────────────────────────────
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Icon?
+Thumbs.db
+
+# ── Editor & IDE ─────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.claude/
+.cursor/
+
+# ── Logs ─────────────────────────────────────────────────────
+*.log
+logs/
+npm-debug.log*
+pnpm-debug.log*
+
+# ── Python virtualenvs ────────────────────────────────────────
+.venv/
+venv/
+.virtualenv/
