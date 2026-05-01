@@ -78,12 +78,21 @@ log "Flatten complete — $(ls "$FLAT_DIR" | wc -l) species classes"
 mkdir -p "$RESULTS_DIR"
 log "Starting CNN training in screen session 'train_cnn' …"
 
+# COLOR_CORRECT is set by the orchestrator's launch_training tool when the user
+# selected a non-default value in the dashboard. Empty → JSON default applies.
+CC_FLAG=""
+if [ -n "${COLOR_CORRECT:-}" ]; then
+  CC_FLAG="--color_correct $COLOR_CORRECT"
+  log "Color correction override: $COLOR_CORRECT"
+fi
+
 screen -dmS train_cnn bash -c "
   cd $REPO_DIR/DeepLearning-tensorFlowLite
   python training_wrapper.py \
     --data_dir $FLAT_DIR \
     --result_dir $RESULTS_DIR \
     --done_file $DONE_FILE \
+    $CC_FLAG \
     2>&1 | tee $RESULTS_DIR/training.log
 "
 

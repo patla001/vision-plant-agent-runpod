@@ -1,4 +1,4 @@
-import { NextResponse } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
 import { spawn, spawnSync } from "child_process";
 import fs from "fs";
 import path from "path";
@@ -8,6 +8,10 @@ const RESULTS = path.join(ROOT, "results");
 const SCRIPTS = path.join(ROOT, "scripts");
 const STATE   = path.join(RESULTS, "pipeline_state.json");
 const LOG     = path.join(RESULTS, "pipeline.log");
+
+// Must match VALID_COLOR_CORRECT in scripts/agents/run_pipeline.py
+const VALID_COLOR_CORRECT = ["none", "gray_world", "max_rgb"] as const;
+type ColorCorrect = typeof VALID_COLOR_CORRECT[number];
 
 function isAlive(pid: number): boolean {
   try { process.kill(pid, 0); return true; } catch { return false; }
@@ -36,7 +40,25 @@ function resolvePython(): string | null {
   return null;
 }
 
-export async function POST() {
+export async function POST(req: NextRequest) {
+  // Optional body: { color_correct?: "none" | "gray_world" | "max_rgb" }
+  // Falls back to model_hyperparameters.json's deep_learning.color_correct
+  // when omitted or empty. Reject unknown values explicitly so a typo from
+  // a future UI change doesn't silently fall through.
+  let colorCorrect: ColorCorrect | null = null;
+  try {
+    const body = await req.json().catch(() => ({}));
+    const raw = typeof body?.color_correct === "string" ? body.color_correct : "";
+    if (raw) {
+      if (!(VALID_COLOR_CORRECT as readonly string[]).includes(raw)) {
+        return NextResponse.json({
+          error: `color_correct must be one of ${VALID_COLOR_CORRECT.join(", ")}.`,
+        }, { status: 400 });
+      }
+      colorCorrect = raw as ColorCorrect;
+    }
+  } catch { /* no body — fine */ }
+
   // Verify Python is callable before doing anything else
   const pythonBin = resolvePython();
   if (!pythonBin) {
@@ -74,6 +96,7 @@ export async function POST() {
       ...process.env,
       PYTHONDONTWRITEBYTECODE: "1",
       PYTHONUNBUFFERED:        "1",
+      ...(colorCorrect ? { PIPELINE_COLOR_CORRECT: colorCorrect } : {}),
     },
   });
   child.unref();
@@ -88,8 +111,9 @@ export async function POST() {
     finished_at: null,
     pid: child.pid,
     python_bin: pythonBin,
+    color_correct: colorCorrect ?? "default",
   };
   fs.writeFileSync(STATE, JSON.stringify(initial, null, 2));
 
-  return NextResponse.json({ started: true, pid: child.pid, python: pythonBin });
+  return NextResponse.json({ started: true, pid: child.pid, python: pythonBin, color_correct: colorCorrect });
 }

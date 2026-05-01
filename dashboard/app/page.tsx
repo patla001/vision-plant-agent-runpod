@@ -149,13 +149,20 @@ export default function DashboardPage() {
                 </p>
               </div>
             </div>
-            <div className="text-right">
+            <div className="text-right flex flex-col items-end gap-2">
               {pipelineState.finished_at && (
                 <p className="text-xs text-slate-600">
                   Finished {new Date(pipelineState.finished_at).toLocaleString()}
                 </p>
               )}
-              <p className="text-[10px] text-slate-700 font-mono mt-0.5">Run: {results.run}</p>
+              <p className="text-[10px] text-slate-700 font-mono">Run: {results.run}</p>
+              <a
+                href="/api/results/tflite"
+                download="plant_classifier_deep_learning.tflite"
+                className="inline-flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg border border-cyan-500/40 bg-cyan-500/10 text-cyan-300 hover:bg-cyan-500/20 transition"
+              >
+                <span>⬇</span> Download TFLite model
+              </a>
             </div>
           </div>
         </div>
