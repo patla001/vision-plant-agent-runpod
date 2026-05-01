@@ -57,12 +57,24 @@ export async function POST() {
   fs.mkdirSync(RESULTS, { recursive: true });
   const logFd = fs.openSync(LOG, "a");
 
-  // Spawn Python pipeline as a fully detached background process
+  // Spawn Python pipeline as a fully detached background process.
+  //
+  // PYTHONDONTWRITEBYTECODE=1 prevents Python from writing __pycache__ .pyc
+  // files. Without this, stale .pyc from a previous git branch (e.g. when
+  // PR #5's _constants module was tested locally) can override fresh .py
+  // sources after a git pull. The mtime-based recompilation check is not
+  // 100% reliable, especially when git restores files with old timestamps.
+  // PYTHONUNBUFFERED=1 ensures stdout flushes immediately so the dashboard
+  // sees log lines in real time instead of after process exit.
   const child = spawn(pythonBin, ["agents/run_pipeline.py"], {
     cwd: SCRIPTS,
     detached: true,
     stdio: ["ignore", logFd, logFd],
-    env: { ...process.env },
+    env: {
+      ...process.env,
+      PYTHONDONTWRITEBYTECODE: "1",
+      PYTHONUNBUFFERED:        "1",
+    },
   });
   child.unref();
   fs.closeSync(logFd);
