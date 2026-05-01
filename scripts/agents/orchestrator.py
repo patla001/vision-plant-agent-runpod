@@ -29,6 +29,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from pipeline_state import write_state
+from _constants import RUNPOD_GPU_TYPE, RUNPOD_DISK_GB
 
 import monitor_agent
 import analysis_agent
@@ -201,11 +202,11 @@ def make_tool_executor(client: anthropic.Anthropic, pod_id_ref: list) -> callabl
 
     def execute(name: str, inputs: dict) -> str:
         if name == "provision_pod":
-            write_state("running", "Provisioning RTX 4090 GPU pod on RunPod...")
+            write_state("running", f"Provisioning {RUNPOD_GPU_TYPE} pod on RunPod...")
             pod_id = runpod_api.create_pod(
                 name="cs659-cnn-training",
-                gpu_type="NVIDIA GeForce RTX 4090",
-                disk_gb=150,
+                gpu_type=RUNPOD_GPU_TYPE,
+                disk_gb=RUNPOD_DISK_GB,
             )
             pod_id_ref[0] = pod_id
             write_state("running", f"Pod created: {pod_id}", pod_id=pod_id)

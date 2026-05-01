@@ -32,7 +32,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
             {/* Badge row */}
             <div className="hidden sm:flex items-center gap-2">
               {[
-                { label: "RTX 4090", color: "cyan" },
+                { label: "H100 80GB", color: "cyan" },
                 { label: "RunPod",   color: "purple" },
                 { label: "Claude",   color: "green" },
               ].map(({ label, color }) => (
