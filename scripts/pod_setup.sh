@@ -47,6 +47,22 @@ git clone --depth=1 "$REPO_URL" "$REPO_DIR"
 log "Installing Python dependencies …"
 pip install -q -r "$REPO_DIR/DeepLearning-tensorFlowLite/requirements-tflite.txt"
 
+# ── 4b. Install GPU-bundled TensorFlow extras (CuDNN, cuBLAS, etc.) ──────────
+# The plain `tensorflow` wheel relies on whatever CuDNN is installed on the
+# system. The runpod/pytorch base image ships CuDNN 9.1.0, but recent TF
+# wheels (2.18+) are compiled against CuDNN 9.3.0, causing:
+#   "Loaded runtime CuDNN library: 9.1.0 but source was compiled with: 9.3.0
+#    DNN library initialization failed."
+#
+# `tensorflow[and-cuda]` adds nvidia-cudnn-cu12 + nvidia-cublas-cu12 + the
+# rest of the NVIDIA Python packages, which match TensorFlow's compile-time
+# version. TF preferentially loads these from site-packages over the system
+# CuDNN, fixing the mismatch.
+log "Installing tensorflow[and-cuda] extras (nvidia-cudnn, cublas, etc.) …"
+pip install -q --upgrade "tensorflow[and-cuda]"
+log "GPU libraries installed:"
+pip list 2>/dev/null | grep -iE "tensorflow|nvidia-cudnn|nvidia-cublas" | head
+
 # ── 5. Flatten dataset using symlinks (saves ~35 GB vs. copies) ───────────────
 log "Flattening dataset (symlinks) …"
 mkdir -p "$FLAT_DIR"
