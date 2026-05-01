@@ -57,6 +57,12 @@ Rules:
 - If check_training_status reports DONE, immediately download and terminate.
 - If check_training_status reports IN_PROGRESS, wait 5 minutes then check again.
 - If check_training_status reports FAILED after an error, download logs first, then terminate.
+- If check_training_status reports POD_UNREACHABLE, the pod has died (RunPod eviction,
+  network failure, etc.). DO NOT keep polling — call terminate_pod immediately to clean
+  up RunPod's records, then end the pipeline with a failure summary. Polling a dead
+  pod wastes Anthropic API calls and never recovers.
+- After 3 consecutive POD_UNREACHABLE reports, abort the pipeline even if you haven't
+  formally seen FAILED — the pod is gone.
 - Never skip the pod termination step — every minute costs money.
 """
 
