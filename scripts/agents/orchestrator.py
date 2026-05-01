@@ -151,13 +151,23 @@ def _scp(ip: str, port: int, local: Path, remote: str) -> None:
     )
 
 
-def _ssh(ip: str, port: int, cmd: str) -> str:
+def _ssh(ip: str, port: int, cmd: str, *, check: bool = True, timeout: int = 60) -> str:
+    """Run a command on the pod via SSH. Raises on non-zero exit when check=True
+    (the default) — this prevents silent failures where a remote command returns
+    127/non-zero but the orchestrator believes everything is fine."""
     r = subprocess.run(
         ["ssh", "-p", str(port), "-o", "StrictHostKeyChecking=no",
          "-o", "ConnectTimeout=20", f"root@{ip}", cmd],
-        capture_output=True, text=True, timeout=60,
+        capture_output=True, text=True, timeout=timeout,
     )
-    return (r.stdout + r.stderr).strip()
+    output = (r.stdout + r.stderr).strip()
+    if check and r.returncode != 0:
+        raise RuntimeError(
+            f"SSH command failed (exit {r.returncode}):\n"
+            f"  cmd: {cmd[:120]}{'...' if len(cmd) > 120 else ''}\n"
+            f"  output: {output}"
+        )
+    return output
 
 
 def make_tool_executor(client: anthropic.Anthropic, pod_id_ref: list) -> callable:
@@ -188,21 +198,30 @@ def make_tool_executor(client: anthropic.Anthropic, pod_id_ref: list) -> callabl
         if name == "launch_training":
             write_state("running", "Uploading scripts and starting dataset download on pod...")
             ip, port = inputs["pod_ip"], inputs["pod_port"]
-            _scp(ip, port, SCRIPTS_DIR / "pod_setup.sh",           "/workspace/pod_setup.sh")
-            _scp(ip, port, DL_DIR / "training_wrapper.py",         "/workspace/training_wrapper.py")
+            _scp(ip, port, SCRIPTS_DIR / "pod_setup.sh",        "/workspace/pod_setup.sh")
+            _scp(ip, port, DL_DIR / "training_wrapper.py",      "/workspace/training_wrapper.py")
             # pod_setup.sh runs wget (31.7 GB), unzip, pip install, flatten — total ~15 min.
-            # Run it inside a screen session so SSH returns immediately (otherwise the
-            # subprocess.run timeout kills it). Setup progress is logged to /workspace/setup.log
-            # which the MonitorAgent can tail.
-            _ssh(
+            # We use `nohup` (always available — unlike `screen`/`tmux` which some RunPod
+            # images don't ship). The setup script runs in the background; SSH returns
+            # in ~2 sec. Verify the process actually started by checking its PID is alive
+            # one second after launch — this catches "command not found" / "permission denied"
+            # type failures that would otherwise be silent.
+            output = _ssh(
                 ip, port,
+                "set -e && "
                 "chmod +x /workspace/pod_setup.sh && "
-                "screen -dmS pod_setup bash -c "
-                "'/workspace/pod_setup.sh > /workspace/setup.log 2>&1'"
+                "nohup bash /workspace/pod_setup.sh "
+                ">  /workspace/setup.log 2>&1 < /dev/null & "
+                "echo $! > /workspace/setup.pid && "
+                "sleep 1 && "
+                "kill -0 $(cat /workspace/setup.pid) "
+                "&& echo SETUP_RUNNING || (echo SETUP_DEAD; tail -50 /workspace/setup.log; exit 1)"
             )
-            write_state("running", "Pod setup running in screen session (downloading 31.7 GB dataset)")
-            return ("Pod setup launched in screen session 'pod_setup'. "
-                    "Setup logs at /workspace/setup.log on pod. "
+            if "SETUP_RUNNING" not in output:
+                raise RuntimeError(f"Setup script failed to start. Output: {output}")
+            write_state("running", "Pod setup running (downloading 31.7 GB dataset, ~15 min)")
+            return ("Pod setup launched via nohup (PID saved to /workspace/setup.pid). "
+                    "Logs at /workspace/setup.log. "
                     "Training will start automatically when setup finishes (~15 min).")
 
         if name == "check_training_status":
