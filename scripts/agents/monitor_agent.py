@@ -99,6 +99,9 @@ _TOOLS = [
 ]
 
 
+SSH_CONNECT_TIMEOUT = 20   # seconds
+
+
 def _ssh_run(ip: str, port: int, cmd: str, timeout: int = SSH_CONNECT_TIMEOUT) -> str:
     """Run a command on the pod via SSH and return its output.
 
