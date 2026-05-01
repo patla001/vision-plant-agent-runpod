@@ -99,11 +99,17 @@ _TOOLS = [
 ]
 
 
-SSH_CONNECT_TIMEOUT = 20   # seconds
+SSH_CONNECT_TIMEOUT = 20      # seconds
+MAX_TOOL_OUTPUT_BYTES = 16000  # ~4K tokens; bounds Monitor context regardless of log size
 
 
 def _ssh_run(ip: str, port: int, cmd: str, timeout: int = SSH_CONNECT_TIMEOUT) -> str:
     """Run a command on the pod via SSH and return its output.
+
+    Output is hard-capped at MAX_TOOL_OUTPUT_BYTES to keep the Monitor's
+    context under Haiku 4.5's 200K limit even when training.log contains
+    pathologically long lines (e.g. Keras progress bars with embedded \\r
+    overwrites that tail -n cannot bound).
 
     If SSH itself fails (connection refused, timeout, host down), prefix the
     output with 'POD_UNREACHABLE:'. The agent is instructed to recognize this
@@ -134,7 +140,11 @@ def _ssh_run(ip: str, port: int, cmd: str, timeout: int = SSH_CONNECT_TIMEOUT) -
         )
     )
     if ssh_failed:
-        return f"POD_UNREACHABLE: {output}"
+        return f"POD_UNREACHABLE: {output[:MAX_TOOL_OUTPUT_BYTES]}"
+
+    if len(output) > MAX_TOOL_OUTPUT_BYTES:
+        # Keep the tail — that's where the latest training progress lives.
+        output = f"[...truncated {len(output) - MAX_TOOL_OUTPUT_BYTES} bytes...]\n" + output[-MAX_TOOL_OUTPUT_BYTES:]
 
     return output
 
@@ -148,11 +158,17 @@ def _execute_tool(name: str, inputs: dict) -> str:
 
     if name == "tail_training_log":
         n = inputs.get("n_lines", 60)
-        return _ssh_run(ip, port, f"tail -n {n} /workspace/results/training.log 2>/dev/null || echo 'Log not found'")
+        # Translate \r to \n so Keras progress bars (which overwrite a single
+        # line via carriage returns) become discrete lines that `tail -n` can
+        # actually bound. Without this, "60 lines" can be hundreds of KB.
+        # `[ -f file ]` precedes the pipe so a missing file still prints the
+        # fallback — relying on `tr | tail || echo` doesn't work because tail
+        # exits 0 on empty stdin even when tr's input redirection fails.
+        return _ssh_run(ip, port, f"[ -f /workspace/results/training.log ] && tr '\\r' '\\n' < /workspace/results/training.log | tail -n {n} || echo 'Log not found'")
 
     if name == "tail_setup_log":
         n = inputs.get("n_lines", 30)
-        return _ssh_run(ip, port, f"tail -n {n} /workspace/setup.log 2>/dev/null || echo 'Setup log not found'")
+        return _ssh_run(ip, port, f"[ -f /workspace/setup.log ] && tr '\\r' '\\n' < /workspace/setup.log | tail -n {n} || echo 'Setup log not found'")
 
     if name == "check_screen_session":
         return _ssh_run(ip, port, "screen -list 2>&1")
