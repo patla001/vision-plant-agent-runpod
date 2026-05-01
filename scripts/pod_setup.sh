@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# Runs ON the RunPod pod (uploaded and executed by launch.py).
+# Runs ON the RunPod pod (uploaded by orchestrator's launch_training tool,
+# then executed via nohup so SSH returns immediately).
 # Downloads PlantNet-300K, sets up the repo, flattens the dataset,
 # then launches the CNN training inside a detached screen session.
 set -euo pipefail
 
 WORKSPACE=/workspace
-REPO_URL="https://github.com/Mason-Leavitt/CS659_Project.git"
+REPO_URL="https://github.com/patla001/vision-plant-agent-runpod.git"
 DATA_ZIP="$WORKSPACE/plantnet_300K.zip"
 DATA_DIR="$WORKSPACE/plantnet_300K"
 FLAT_DIR="$WORKSPACE/plantnet_flat"
@@ -14,6 +15,16 @@ REPO_DIR="$WORKSPACE/cs659"
 DONE_FILE="$WORKSPACE/DONE"
 
 log() { echo "[$(date -u '+%Y-%m-%d %H:%M:%S UTC')] $*"; }
+
+# ── 0. Install required system tools ──────────────────────────────────────────
+# Some RunPod images (including the pytorch:2.4.0-py3.11-cuda12.4.1 image we
+# use) ship without `screen` or `rsync`. Install them upfront before any code
+# tries to use them. apt-get is always present on Ubuntu-based RunPod images.
+log "Installing required system tools (screen, rsync, wget, unzip, git) …"
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -qq
+apt-get install -y -qq screen rsync wget unzip git
+log "System tools installed: screen=$(command -v screen) rsync=$(command -v rsync)"
 
 # ── 1. Download PlantNet-300K ──────────────────────────────────────────────────
 log "Downloading PlantNet-300K (31.7 GB) …"
