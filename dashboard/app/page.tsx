@@ -78,6 +78,54 @@ export default function DashboardPage() {
     );
   }
 
+  /* ── Done but no results were produced (failed agent run, etc.) ──── */
+  if (pipelineState.status === "done" && !pipelineState.hasResults) {
+    return (
+      <div className="space-y-6 animate-float-up">
+        <div className="relative overflow-hidden glass rounded-2xl px-5 py-5 border border-amber-500/30">
+          <div className="absolute inset-0 bg-gradient-to-r from-amber-500/5 to-transparent pointer-events-none" />
+          <div className="flex items-start gap-4">
+            <span className="text-2xl">⚠️</span>
+            <div className="flex-1">
+              <p className="font-bold text-amber-300 text-base">Pipeline marked complete, but no results were produced</p>
+              <p className="text-sm text-amber-500/80 mt-1">
+                The orchestrator finished without downloading any training artifacts. This usually means
+                the training itself failed but the agent decided to stop. Check the agent summary below
+                for the post-mortem, then click "Start Over" to try again.
+              </p>
+            </div>
+          </div>
+        </div>
+
+        {pipelineState.summary && (
+          <section>
+            <div className="flex items-center gap-3 mb-4">
+              <h2 className="text-lg font-bold gradient-text-cyan-purple">Agent Post-Mortem</h2>
+              <span className="text-[10px] px-2 py-0.5 rounded-full border border-violet-500/30 text-violet-400 bg-violet-500/5">
+                Claude Opus 4.7
+              </span>
+            </div>
+            <div className="glass rounded-2xl border border-white/5 px-6 py-5 text-sm text-slate-300 whitespace-pre-wrap leading-relaxed font-mono">
+              {pipelineState.summary}
+            </div>
+          </section>
+        )}
+
+        <div className="flex gap-3">
+          <button
+            onClick={async () => {
+              await fetch("/api/pipeline/reset", { method: "POST" }).catch(() => {});
+              setPipelineState({ status: "idle" });
+            }}
+            className="px-6 py-2.5 bg-gradient-to-r from-cyan-600 to-violet-600 hover:from-cyan-500 hover:to-violet-500 rounded-xl text-sm font-semibold transition-all shadow-neon-cyan"
+          >
+            🔄 Start Over
+          </button>
+        </div>
+      </div>
+    );
+  }
+
   /* ── Results view ──────────────────────────────────────────── */
   if (pipelineState.status === "done" && results) {
     return (
