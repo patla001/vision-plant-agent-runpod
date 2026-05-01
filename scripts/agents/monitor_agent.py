@@ -28,14 +28,21 @@ You have these SSH-based tools:
 - tail_setup_log:      Read last lines of /workspace/setup.log (SETUP phase)
 - check_screen_session: List running screen sessions (only 'train_cnn' during TRAINING phase)
 
+CRITICAL: If ANY tool response begins with the literal string 'POD_UNREACHABLE:', the
+pod has died (RunPod evicted the host, network failed, etc.). In that case, do NOT
+report 'IN_PROGRESS' — report 'POD_UNREACHABLE' so the orchestrator can terminate
+the dead pod and abort. Continuing to poll a dead pod wastes time and money.
+
 Steps:
 1. Check if DONE sentinel exists. If yes, training is complete — report DONE + status.
-2. Tail setup.log AND training.log to determine which phase we're in:
+2. If any tool returns 'POD_UNREACHABLE:' → report POD_UNREACHABLE immediately.
+3. Tail setup.log AND training.log to determine which phase we're in:
    - setup.log growing, no training.log yet → SETUP_IN_PROGRESS
    - training.log exists and growing → TRAINING_IN_PROGRESS
    - check_screen_session shows train_cnn alive → TRAINING_IN_PROGRESS
    - Neither log growing for several checks and no DONE → FAILED
-3. Return a clear status report: DONE / SETUP_IN_PROGRESS / TRAINING_IN_PROGRESS / FAILED.
+4. Return a clear status report: DONE / SETUP_IN_PROGRESS / TRAINING_IN_PROGRESS /
+   POD_UNREACHABLE / FAILED.
 """
 
 _TOOLS = [
@@ -92,13 +99,41 @@ _TOOLS = [
 ]
 
 
-def _ssh_run(ip: str, port: int, cmd: str, timeout: int = 20) -> str:
-    result = subprocess.run(
-        ["ssh", "-p", str(port), "-o", "StrictHostKeyChecking=no",
-         "-o", f"ConnectTimeout={timeout}", f"root@{ip}", cmd],
-        capture_output=True, text=True, timeout=timeout + 5,
+def _ssh_run(ip: str, port: int, cmd: str, timeout: int = SSH_CONNECT_TIMEOUT) -> str:
+    """Run a command on the pod via SSH and return its output.
+
+    If SSH itself fails (connection refused, timeout, host down), prefix the
+    output with 'POD_UNREACHABLE:'. The agent is instructed to recognize this
+    sentinel and report POD_UNREACHABLE / FAILED to the orchestrator instead
+    of treating SSH errors as legitimate "no progress yet" data.
+    """
+    try:
+        result = subprocess.run(
+            ["ssh", "-T", "-n",
+             "-p", str(port),
+             "-o", "StrictHostKeyChecking=no",
+             "-o", f"ConnectTimeout={timeout}",
+             f"root@{ip}", cmd],
+            capture_output=True, text=True, timeout=timeout + 5,
+        )
+    except subprocess.TimeoutExpired:
+        return f"POD_UNREACHABLE: ssh subprocess timed out after {timeout + 5}s"
+
+    output = (result.stdout + result.stderr).strip()
+
+    # SSH connection-level failures (255 is the canonical 'ssh failed to
+    # establish session' exit code; we also pattern-match common error
+    # messages for robustness).
+    ssh_failed = result.returncode == 255 or any(
+        marker in output.lower() for marker in (
+            "connection refused", "connection reset", "no route to host",
+            "host is down", "name or service not known", "operation timed out",
+        )
     )
-    return (result.stdout + result.stderr).strip()
+    if ssh_failed:
+        return f"POD_UNREACHABLE: {output}"
+
+    return output
 
 
 def _execute_tool(name: str, inputs: dict) -> str:
