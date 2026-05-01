@@ -43,18 +43,30 @@ import orchestrator
 from pipeline_state import write_state, write_error
 
 
+VALID_COLOR_CORRECT = ("none", "gray_world", "max_rgb")
+
+
 def main() -> None:
     client = anthropic.Anthropic()
+
+    # Per-run color-correction override, set by /api/pipeline/start when the
+    # user picks a value in the dashboard. Empty/missing → JSON default applies.
+    cc = os.environ.get("PIPELINE_COLOR_CORRECT") or None
+    if cc and cc not in VALID_COLOR_CORRECT:
+        print(f"Error: PIPELINE_COLOR_CORRECT={cc!r} not in {VALID_COLOR_CORRECT}")
+        sys.exit(1)
 
     print("=" * 60)
     print("CS659 Multi-Agent CNN Training Pipeline")
     print("Models: Orchestrator=claude-opus-4-7 | Monitor=claude-haiku-4-5 | Analysis=claude-opus-4-7")
+    if cc:
+        print(f"Color correction override: {cc}")
     print("=" * 60)
 
     write_state("running", "Orchestrator initializing...", pid=os.getpid())
 
     try:
-        summary = orchestrator.run(client)
+        summary = orchestrator.run(client, color_correct=cc)
         write_state("done", "Pipeline complete.", summary=summary)
         print("\n" + "=" * 60)
         print("PIPELINE COMPLETE")

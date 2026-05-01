@@ -194,10 +194,18 @@ def _ssh(ip: str, port: int, cmd: str, *, check: bool = True, timeout: int = 60)
     return output
 
 
-def make_tool_executor(client: anthropic.Anthropic, pod_id_ref: list) -> callable:
+def make_tool_executor(
+    client: anthropic.Anthropic,
+    pod_id_ref: list,
+    color_correct: str | None = None,
+) -> callable:
     """
     Returns a tool executor closure that captures client and a mutable pod_id_ref.
     pod_id_ref[0] is updated when provision_pod runs so terminate_pod can use it.
+
+    color_correct, when set ("none" | "gray_world" | "max_rgb"), is exported as
+    the COLOR_CORRECT env var on the pod when launch_training runs pod_setup.sh.
+    pod_setup.sh forwards it as --color_correct to training_wrapper.py.
     """
 
     def execute(name: str, inputs: dict) -> str:
@@ -251,11 +259,17 @@ def make_tool_executor(client: anthropic.Anthropic, pod_id_ref: list) -> callabl
             #
             # The PID is written to /workspace/setup.pid *inside* the subshell
             # so the parent shell can verify the process is still alive 1s later.
+            # Build the optional COLOR_CORRECT env-var prefix. Validated already
+            # at the run_pipeline.py boundary, so we just pass it through.
+            cc_export = ""
+            if color_correct:
+                cc_export = f"COLOR_CORRECT={color_correct} "
+
             output = _ssh(
                 ip, port,
                 "set -e && "
                 "chmod +x /workspace/pod_setup.sh && "
-                "( setsid bash /workspace/pod_setup.sh "
+                f"( setsid env {cc_export}bash /workspace/pod_setup.sh "
                 "    > /workspace/setup.log 2>&1 < /dev/null & "
                 "  echo $! > /workspace/setup.pid ) && "
                 "sleep 1 && "
@@ -327,8 +341,13 @@ def make_tool_executor(client: anthropic.Anthropic, pod_id_ref: list) -> callabl
     return execute
 
 
-def run(client: anthropic.Anthropic) -> str:
-    """Run the full orchestrator pipeline. Returns the final summary."""
+def run(client: anthropic.Anthropic, color_correct: str | None = None) -> str:
+    """Run the full orchestrator pipeline. Returns the final summary.
+
+    color_correct: optional override for the deep-learning color correction
+    method ("none" | "gray_world" | "max_rgb"). When None, the JSON file's
+    default (`deep_learning.color_correct`) is used.
+    """
     pod_id_ref: list = [None]   # mutable reference so tool executor can share pod_id
 
     return run_agent_loop(
@@ -338,14 +357,14 @@ def run(client: anthropic.Anthropic) -> str:
         tools=_TOOLS,
         initial_message=(
             "Run the complete CS659 CNN training pipeline:\n"
-            "1. Provision a RunPod RTX 4090 pod\n"
+            f"1. Provision a RunPod {RUNPOD_GPU_TYPE} pod\n"
             "2. Launch CNN training on PlantNet-300K (wget → flatten → train)\n"
             "3. Monitor training every 5 minutes until done\n"
             "4. Download results and terminate the pod\n"
             "5. Analyze results and return a final summary\n"
             "Proceed autonomously. Remember to ALWAYS terminate the pod."
         ),
-        tool_executor=make_tool_executor(client, pod_id_ref),
+        tool_executor=make_tool_executor(client, pod_id_ref, color_correct=color_correct),
         model="claude-opus-4-7",
         # Long pipeline: provision (1) + wait_ssh (1) + launch (1) + N×{monitor + wait_minutes}
         # + download (1) + terminate (1) + analyze (1) = 6 + 2N. For 4-hour training

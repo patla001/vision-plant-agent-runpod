@@ -59,6 +59,7 @@ export default function PipelineControl({ initialState, onResultsReady }: Props)
   const [state, setState]   = useState<State>(initialState);
   const [starting, setStarting] = useState(false);
   const [startError, setStartError] = useState<string | null>(null);
+  const [colorCorrect, setColorCorrect] = useState<"none" | "gray_world" | "max_rgb">("none");
 
   useEffect(() => {
     if (state.status !== "running") return;
@@ -74,7 +75,11 @@ export default function PipelineControl({ initialState, onResultsReady }: Props)
     setStarting(true);
     setStartError(null);
     try {
-      const res  = await fetch("/api/pipeline/start", { method: "POST" });
+      const res  = await fetch("/api/pipeline/start", {
+        method:  "POST",
+        headers: { "Content-Type": "application/json" },
+        body:    JSON.stringify({ color_correct: colorCorrect }),
+      });
       const data = await res.json();
       if (!res.ok) { setStartError(data.error ?? "Failed to start"); setStarting(false); return; }
       const status: State = await fetch("/api/pipeline/status").then((r) => r.json());
@@ -84,7 +89,7 @@ export default function PipelineControl({ initialState, onResultsReady }: Props)
     } finally {
       setStarting(false);
     }
-  }, []);
+  }, [colorCorrect]);
 
   const handleRetry = useCallback(async () => {
     setState({ status: "idle" });
@@ -157,6 +162,27 @@ export default function PipelineControl({ initialState, onResultsReady }: Props)
               {label}
             </div>
           ))}
+        </div>
+
+        {/* Color correction picker */}
+        <div className="glass rounded-2xl p-4 w-full max-w-md text-left space-y-2">
+          <label htmlFor="cc-select" className="block text-xs font-semibold text-slate-400 uppercase tracking-widest">
+            Color correction
+          </label>
+          <select
+            id="cc-select"
+            value={colorCorrect}
+            onChange={(e) => setColorCorrect(e.target.value as typeof colorCorrect)}
+            disabled={starting}
+            className="w-full bg-slate-900/60 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-200 focus:outline-none focus:border-cyan-400"
+          >
+            <option value="none">None — use raw RGB (default)</option>
+            <option value="gray_world">Gray-world — assumes neutral scene mean</option>
+            <option value="max_rgb">Max-RGB — uses per-channel highlights</option>
+          </select>
+          <p className="text-[11px] text-slate-500 leading-relaxed">
+            Applied to images at training time. Inference must use the same value.
+          </p>
         </div>
 
         {startError && (

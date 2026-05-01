@@ -34,10 +34,13 @@ def _fmt(seconds: float) -> str:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data_dir",   required=True,  type=Path)
-    parser.add_argument("--result_dir", required=True,  type=Path)
-    parser.add_argument("--done_file",  required=True,  type=Path)
-    parser.add_argument("--config",     default=Path(__file__).parent / "model_hyperparameters.json", type=Path)
+    parser.add_argument("--data_dir",      required=True, type=Path)
+    parser.add_argument("--result_dir",    required=True, type=Path)
+    parser.add_argument("--done_file",     required=True, type=Path)
+    parser.add_argument("--config",        default=Path(__file__).parent / "model_hyperparameters.json", type=Path)
+    # Per-run override for color correction. Empty/missing → fall back to JSON default.
+    # Valid values come from color_correction.COLOR_METHODS = ("none", "gray_world", "max_rgb").
+    parser.add_argument("--color_correct", default=None, choices=[None, "none", "gray_world", "max_rgb"])
     args = parser.parse_args()
 
     args.result_dir.mkdir(parents=True, exist_ok=True)
@@ -52,16 +55,27 @@ def main() -> None:
     _log(f"Hyperparameters (deep_learning section):")
     for k, v in dl.items():
         _log(f"  {k}: {v}")
+    if args.color_correct:
+        _log(f"  color_correct override: {args.color_correct}")
 
     script = Path(__file__).parent / "train_export_tflite.py"
 
+    # Write the .tflite into result_dir so it gets picked up by the orchestrator's
+    # rsync of /workspace/results/. Default --out_tflite is the cwd-relative
+    # plant_classifier_deep_learning.tflite which would land in the repo dir
+    # and never reach the dashboard.
+    tflite_out = args.result_dir / "plant_classifier_deep_learning.tflite"
+
     cmd = [
         sys.executable, str(script),
-        "--data_dir",  str(args.data_dir),
-        "--log_dir",   str(args.result_dir),
+        "--data_dir",   str(args.data_dir),
+        "--log_dir",    str(args.result_dir),
+        "--out_tflite", str(tflite_out),
         # All other hyperparameter defaults are read from model_hyperparameters.json
         # by train_export_tflite.py automatically via experiment_config.merge_config_into_argparse_defaults
     ]
+    if args.color_correct:
+        cmd += ["--color_correct", args.color_correct]
 
     _log(f"Running: {' '.join(cmd)}")
     start = time.time()
