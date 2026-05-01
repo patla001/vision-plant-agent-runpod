@@ -145,19 +145,36 @@ _TOOLS = [
 
 def _scp(ip: str, port: int, local: Path, remote: str) -> None:
     subprocess.run(
-        ["scp", "-P", str(port), "-o", "StrictHostKeyChecking=no",
+        ["scp", "-q",
+         "-P", str(port),
+         "-o", "StrictHostKeyChecking=no",
+         "-o", "ConnectTimeout=20",
          str(local), f"root@{ip}:{remote}"],
-        check=True,
+        check=True, timeout=60,
     )
 
 
 def _ssh(ip: str, port: int, cmd: str, *, check: bool = True, timeout: int = 60) -> str:
-    """Run a command on the pod via SSH. Raises on non-zero exit when check=True
-    (the default) — this prevents silent failures where a remote command returns
-    127/non-zero but the orchestrator believes everything is fine."""
+    """Run a command on the pod via SSH.
+
+    Flags used:
+      -T  Disable pseudo-tty allocation. Without this, backgrounded processes
+          on the remote side can hold the PTY open and prevent SSH from
+          returning even after redirections.
+      -n  Redirect local stdin from /dev/null. Prevents SSH from waiting on
+          local-side stdin to close.
+      -o StrictHostKeyChecking=no  Ephemeral pods have new host keys.
+      -o ConnectTimeout=20         Bail fast if pod isn't reachable.
+
+    Raises RuntimeError on non-zero exit (when check=True, the default) so
+    silent remote failures (e.g. command-not-found) become loud errors.
+    """
     r = subprocess.run(
-        ["ssh", "-p", str(port), "-o", "StrictHostKeyChecking=no",
-         "-o", "ConnectTimeout=20", f"root@{ip}", cmd],
+        ["ssh", "-T", "-n",
+         "-p", str(port),
+         "-o", "StrictHostKeyChecking=no",
+         "-o", "ConnectTimeout=20",
+         f"root@{ip}", cmd],
         capture_output=True, text=True, timeout=timeout,
     )
     output = (r.stdout + r.stderr).strip()
@@ -216,19 +233,29 @@ def make_tool_executor(client: anthropic.Anthropic, pod_id_ref: list) -> callabl
             #
             # Verify the process actually started by checking its PID is alive 1s after
             # launch — catches "command not found" / "permission denied" silent failures.
+            # Reliable pattern: the inner subshell `( ... & ... )` backgrounds
+            # the setsid call AND immediately exits the subshell — so the
+            # *outer* shell that SSH is connected to has no backgrounded jobs
+            # at all. SSH sees a clean exit and disconnects.
+            #
+            # Combined with `ssh -T -n` (no PTY, no local stdin), this is the
+            # canonical "fire-and-forget over SSH" recipe that survives picky
+            # OpenSSH server configurations.
+            #
+            # The PID is written to /workspace/setup.pid *inside* the subshell
+            # so the parent shell can verify the process is still alive 1s later.
             output = _ssh(
                 ip, port,
                 "set -e && "
                 "chmod +x /workspace/pod_setup.sh && "
-                "setsid bash /workspace/pod_setup.sh "
-                "  > /workspace/setup.log 2>&1 < /dev/null & "
-                "PID=$! && "
-                "disown && "
-                "echo $PID > /workspace/setup.pid && "
+                "( setsid bash /workspace/pod_setup.sh "
+                "    > /workspace/setup.log 2>&1 < /dev/null & "
+                "  echo $! > /workspace/setup.pid ) && "
                 "sleep 1 && "
+                "PID=$(cat /workspace/setup.pid) && "
                 "(kill -0 $PID 2>/dev/null && echo SETUP_RUNNING) || "
                 "(echo SETUP_DEAD; tail -50 /workspace/setup.log; exit 1)",
-                timeout=120,   # generous for slow networks / first-connect latency
+                timeout=60,
             )
             if "SETUP_RUNNING" not in output:
                 raise RuntimeError(f"Setup script failed to start. Output: {output}")
