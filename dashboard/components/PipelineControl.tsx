@@ -9,9 +9,9 @@ import Diagnostics from "./Diagnostics";
 const HeroScene   = dynamic(() => import("./HeroScene"),   { ssr: false });
 const TrainingOrb = dynamic(() => import("./TrainingOrb"), { ssr: false });
 
-// RTX 4090 on RunPod is currently ~$0.74/hr (as of Apr 2026).
+// H100 SXM on RunPod is currently ~$2.69/hr on-demand (as of May 2026).
 // This is a rough estimate — real billing happens on RunPod's side.
-const GPU_HOURLY_RATE = 0.74;
+const GPU_HOURLY_RATE = 2.69;
 
 interface Issue {
   type: "error" | "warning";
@@ -137,9 +137,9 @@ export default function PipelineControl({ initialState, onResultsReady }: Props)
 
         {/* Stats row */}
         <div className="grid grid-cols-3 gap-3 w-full max-w-sm">
-          <StatBadge label="GPU"      value="RTX 4090" color="cyan" />
-          <StatBadge label="Est. Time" value="3–4 hrs"  color="purple" />
-          <StatBadge label="Est. Cost" value="~$4"      color="green" />
+          <StatBadge label="GPU"      value="H100 80GB" color="cyan" />
+          <StatBadge label="Est. Time" value="1–2 hrs"  color="purple" />
+          <StatBadge label="Est. Cost" value="~$5"      color="green" />
         </div>
 
         {/* Prerequisites card */}
@@ -224,7 +224,7 @@ export default function PipelineControl({ initialState, onResultsReady }: Props)
         {/* Info row */}
         <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
           <StatBadge label="Elapsed"  value={`${elapsed} min`}                                 color="cyan" />
-          <StatBadge label="GPU"      value="RTX 4090"                                          color="purple" />
+          <StatBadge label="GPU"      value="H100 80GB"                                          color="purple" />
           <StatBadge label="Est. Cost" value={`$${((elapsed / 60) * GPU_HOURLY_RATE).toFixed(2)}`} color="green" />
           <StatBadge label="Status"   value="Running"                                           color="cyan" />
         </div>

@@ -3,7 +3,7 @@
 > **SDSU Spring 2026 — CS659 Project**
 > Group members: Ezer, Mason, Gigi
 
-A browser-driven, multi-agent system that trains a MobileNetV2 plant classifier on the **PlantNet-300K** dataset using a **remote NVIDIA RTX 4090** (RunPod), with three Anthropic-SDK agents collaborating to provision the GPU, monitor training, download results, terminate the pod, and produce an analysis report — all from a single click in a Next.js dashboard.
+A browser-driven, multi-agent system that trains a MobileNetV2 plant classifier on the **PlantNet-300K** dataset using a **remote NVIDIA H100 80GB SXM** (RunPod), with three Anthropic-SDK agents collaborating to provision the GPU, monitor training, download results, terminate the pod, and produce an analysis report — all from a single click in a Next.js dashboard.
 
 ## What this project demonstrates
 
@@ -47,7 +47,7 @@ A browser-driven, multi-agent system that trains a MobileNetV2 plant classifier 
                              │
                              ▼
 ┌──────────────────────────────────────────────────────────────────┐
-│  RunPod RTX 4090 Pod (ephemeral, ~3–4 hours per run)              │
+│  RunPod H100 80GB Pod (ephemeral, ~1–2 hours per run)             │
 │  ├── wget plantnet_300K.zip (31.7 GB) → unzip → flatten symlinks │
 │  ├── pip install requirements                                     │
 │  └── screen -dmS train_cnn  python train_export_tflite.py         │
@@ -82,7 +82,7 @@ cd dashboard && pnpm dev
 # Open http://localhost:3000 → click ⚡ Start Training Pipeline
 ```
 
-A complete training run takes about **3–4 hours** and costs roughly **$3–4** in RunPod GPU time. You can close the browser tab and come back — state persists in `results/pipeline_state.json`.
+A complete training run takes about **1–2 hours** and costs roughly **$3–6** in RunPod GPU time (H100 SXM is ~$2.69/hr on-demand). You can close the browser tab and come back — state persists in `results/pipeline_state.json`.
 
 ## Tech stack
 
@@ -90,7 +90,7 @@ A complete training run takes about **3–4 hours** and costs roughly **$3–4**
 |-------|-----------|
 | ML | TensorFlow 2.x, MobileNetV2, scikit-learn, scikit-image |
 | Agents | Anthropic SDK (Python), Claude Opus 4.7 + Haiku 4.5 |
-| GPU | RunPod (NVIDIA RTX 4090, 24 GB VRAM, 150 GB disk) |
+| GPU | RunPod (NVIDIA H100 80GB SXM, 80 GB VRAM, 150 GB disk) |
 | Dashboard | Next.js 14 (App Router), TypeScript, Tailwind CSS |
 | Visualization | Three.js, Recharts |
 | Runtime | Python 3.10+, Node.js 18+, pnpm |

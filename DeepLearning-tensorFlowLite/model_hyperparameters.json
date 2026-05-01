@@ -27,7 +27,7 @@
   },
   "deep_learning": {
     "img_size": 224,
-    "batch_size": 16,
+    "batch_size": 64,
     "epochs": 25,
     "learning_rate": 0.0001,
     "color_correct": "none",
