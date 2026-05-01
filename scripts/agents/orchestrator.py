@@ -201,26 +201,39 @@ def make_tool_executor(client: anthropic.Anthropic, pod_id_ref: list) -> callabl
             _scp(ip, port, SCRIPTS_DIR / "pod_setup.sh",        "/workspace/pod_setup.sh")
             _scp(ip, port, DL_DIR / "training_wrapper.py",      "/workspace/training_wrapper.py")
             # pod_setup.sh runs wget (31.7 GB), unzip, pip install, flatten — total ~15 min.
-            # We use `nohup` (always available — unlike `screen`/`tmux` which some RunPod
-            # images don't ship). The setup script runs in the background; SSH returns
-            # in ~2 sec. Verify the process actually started by checking its PID is alive
-            # one second after launch — this catches "command not found" / "permission denied"
-            # type failures that would otherwise be silent.
+            #
+            # We use `setsid` to fully detach the background process from the SSH session.
+            # Without setsid, SSH may wait for the backgrounded process's file descriptors
+            # to close even though we redirected them — this manifests as the SSH command
+            # hanging until the 60-second subprocess timeout fires.
+            #
+            # `setsid` creates a new session leader, which:
+            #   1. Detaches from the controlling terminal (SSH session)
+            #   2. Survives parent shell exit independent of nohup behavior
+            #   3. Allows SSH to return as soon as the foreground commands finish
+            #
+            # `disown` after backgrounding tells bash not to track this job at all.
+            #
+            # Verify the process actually started by checking its PID is alive 1s after
+            # launch — catches "command not found" / "permission denied" silent failures.
             output = _ssh(
                 ip, port,
                 "set -e && "
                 "chmod +x /workspace/pod_setup.sh && "
-                "nohup bash /workspace/pod_setup.sh "
-                ">  /workspace/setup.log 2>&1 < /dev/null & "
-                "echo $! > /workspace/setup.pid && "
+                "setsid bash /workspace/pod_setup.sh "
+                "  > /workspace/setup.log 2>&1 < /dev/null & "
+                "PID=$! && "
+                "disown && "
+                "echo $PID > /workspace/setup.pid && "
                 "sleep 1 && "
-                "kill -0 $(cat /workspace/setup.pid) "
-                "&& echo SETUP_RUNNING || (echo SETUP_DEAD; tail -50 /workspace/setup.log; exit 1)"
+                "(kill -0 $PID 2>/dev/null && echo SETUP_RUNNING) || "
+                "(echo SETUP_DEAD; tail -50 /workspace/setup.log; exit 1)",
+                timeout=120,   # generous for slow networks / first-connect latency
             )
             if "SETUP_RUNNING" not in output:
                 raise RuntimeError(f"Setup script failed to start. Output: {output}")
             write_state("running", "Pod setup running (downloading 31.7 GB dataset, ~15 min)")
-            return ("Pod setup launched via nohup (PID saved to /workspace/setup.pid). "
+            return ("Pod setup launched via setsid (PID saved to /workspace/setup.pid). "
                     "Logs at /workspace/setup.log. "
                     "Training will start automatically when setup finishes (~15 min).")
 
