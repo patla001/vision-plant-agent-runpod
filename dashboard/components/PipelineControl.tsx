@@ -34,6 +34,22 @@ interface State {
   error_type?: string;
   error_message?: string;
   error_traceback?: string;
+  // Pod-side run fields written by laptop_bootstrap.py
+  pod_id?: string;
+  pod_ip?: string;
+  pod_port?: number;
+  run_tag?: string;
+  screen_session?: string;
+  color_correct?: string;
+}
+
+interface PollPodResponse {
+  inferredStatus: "idle" | "bootstrapping" | "training" | "uploading" | "done" | "unknown" | "failed";
+  pod: { alive: boolean; desiredStatus: string | null } | null;
+  release: { url: string; draft: boolean } | null;
+  runTag?: string;
+  podId?: string;
+  ownerRepo?: { owner: string; repo: string };
 }
 
 interface Props {
@@ -70,6 +86,49 @@ export default function PipelineControl({ initialState, onResultsReady }: Props)
     }, 10_000);
     return () => clearInterval(id);
   }, [state.status, onResultsReady]);
+
+  /* Pod-side run state — polled less aggressively (60s) since each tick
+   * makes a RunPod + GitHub API call. Refresh button forces an immediate poll. */
+  const [podPoll, setPodPoll] = useState<PollPodResponse | null>(null);
+  const [pollRefreshing, setPollRefreshing] = useState(false);
+  const [syncing, setSyncing] = useState(false);
+  const [syncError, setSyncError] = useState<string | null>(null);
+
+  const refreshPodPoll = useCallback(async () => {
+    setPollRefreshing(true);
+    try {
+      const r = await fetch("/api/pipeline/poll-pod");
+      if (r.ok) setPodPoll(await r.json());
+    } finally {
+      setPollRefreshing(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (state.status !== "running-on-pod") return;
+    refreshPodPoll();
+    const id = setInterval(refreshPodPoll, 60_000);
+    return () => clearInterval(id);
+  }, [state.status, refreshPodPoll]);
+
+  // When poll-pod reports the run is done, sync local results so the rich
+  // results dashboard (TrainingCurves, ConfusionMatrix, etc.) works.
+  const handleSyncRelease = useCallback(async () => {
+    setSyncing(true);
+    setSyncError(null);
+    try {
+      const r = await fetch("/api/pipeline/sync-release", { method: "POST" });
+      const data = await r.json();
+      if (!r.ok) { setSyncError(data.error ?? "Sync failed"); return; }
+      // After sync, transition local state to "done" so the page shows results.
+      setState((prev) => ({ ...prev, status: "done", hasResults: true }));
+      onResultsReady();
+    } catch (e) {
+      setSyncError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSyncing(false);
+    }
+  }, [onResultsReady]);
 
   const handleStart = useCallback(async () => {
     setStarting(true);
@@ -116,6 +175,98 @@ export default function PipelineControl({ initialState, onResultsReady }: Props)
       setAborting(false);
     }
   }, []);
+
+  /* ── RUNNING ON POD (detached) ─────────────────────────────── */
+  if (state.status === "running-on-pod") {
+    const sshCmd = state.pod_ip && state.pod_port
+      ? `ssh -p ${state.pod_port} root@${state.pod_ip}`
+      : null;
+    const inferred = podPoll?.inferredStatus ?? "training";
+    const releaseUrl = podPoll?.release?.url;
+    const podAlive = podPoll?.pod?.alive ?? null;
+
+    const statusLabel: Record<string, { text: string; color: string }> = {
+      bootstrapping: { text: "Bootstrapping (provision in progress)", color: "text-violet-300" },
+      training:      { text: "Training on pod",                       color: "text-cyan-300"   },
+      uploading:     { text: "Uploading results to GitHub",           color: "text-amber-300"  },
+      done:          { text: "Done — pod terminated",                 color: "text-emerald-300"},
+      unknown:       { text: "Unknown — pod gone, no Release",        color: "text-red-300"    },
+      failed:        { text: "Failed",                                  color: "text-red-300"    },
+    };
+    const sl = statusLabel[inferred] ?? { text: inferred, color: "text-slate-300" };
+
+    return (
+      <div className="animate-float-up flex flex-col items-center gap-6 min-h-[60vh] px-4">
+        <div className="glass rounded-2xl p-6 w-full max-w-2xl space-y-4 border border-cyan-500/25">
+          <div className="flex items-center justify-between flex-wrap gap-3">
+            <div>
+              <p className="text-xs uppercase tracking-widest text-slate-500">Run on pod (detached)</p>
+              <h2 className={`text-xl font-bold ${sl.color}`}>{sl.text}</h2>
+            </div>
+            <button
+              onClick={refreshPodPoll}
+              disabled={pollRefreshing}
+              className="text-sm px-4 py-2 rounded-lg border border-cyan-500/40 bg-cyan-500/10 text-cyan-300 hover:bg-cyan-500/20 transition disabled:opacity-50"
+            >
+              {pollRefreshing ? "Refreshing…" : "↻ Refresh status"}
+            </button>
+          </div>
+
+          <div className="grid grid-cols-2 gap-2 text-sm">
+            <div className="text-slate-500">Pod ID</div>
+            <div className="font-mono text-slate-300">{state.pod_id ?? "—"}</div>
+            <div className="text-slate-500">Run tag</div>
+            <div className="font-mono text-slate-300">{state.run_tag ?? "—"}</div>
+            <div className="text-slate-500">Pod state</div>
+            <div className="font-mono text-slate-300">
+              {podAlive === null ? "—" : (podAlive ? "RUNNING" : (podPoll?.pod?.desiredStatus ?? "GONE"))}
+            </div>
+            <div className="text-slate-500">Color correction</div>
+            <div className="font-mono text-slate-300">{state.color_correct ?? "default"}</div>
+          </div>
+
+          {sshCmd && (
+            <div className="bg-slate-900/60 border border-slate-700 rounded-lg p-3">
+              <p className="text-[10px] uppercase tracking-widest text-slate-500 mb-1">Inspect manually</p>
+              <code className="text-xs font-mono text-slate-300 break-all">{sshCmd}</code>
+              <p className="text-[10px] text-slate-500 mt-1">
+                Then: <code className="font-mono">screen -r cs659</code>
+              </p>
+            </div>
+          )}
+
+          {releaseUrl && (
+            <a
+              href={releaseUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="inline-flex items-center gap-2 text-sm text-cyan-300 hover:text-cyan-200"
+            >
+              ⧉ View GitHub Release
+            </a>
+          )}
+
+          {inferred === "done" && (
+            <div className="space-y-2 pt-2 border-t border-slate-800">
+              <button
+                onClick={handleSyncRelease}
+                disabled={syncing}
+                className="w-full px-4 py-3 rounded-lg bg-emerald-500/15 border border-emerald-500/40 text-emerald-300 hover:bg-emerald-500/25 transition disabled:opacity-50"
+              >
+                {syncing ? "Downloading artifacts…" : "⬇ Sync results from Release & open dashboard"}
+              </button>
+              {syncError && <p className="text-xs text-red-400">{syncError}</p>}
+            </div>
+          )}
+
+          <p className="text-[11px] text-slate-500 leading-relaxed pt-2 border-t border-slate-800">
+            The pod runs autonomously — close this tab, shut down your laptop, or come back hours later.
+            Results will be uploaded to a GitHub Release before the pod self-terminates.
+          </p>
+        </div>
+      </div>
+    );
+  }
 
   /* ── IDLE ──────────────────────────────────────────────────── */
   if (state.status === "idle") {

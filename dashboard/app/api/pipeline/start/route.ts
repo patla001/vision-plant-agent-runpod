@@ -88,7 +88,10 @@ export async function POST(req: NextRequest) {
   // 100% reliable, especially when git restores files with old timestamps.
   // PYTHONUNBUFFERED=1 ensures stdout flushes immediately so the dashboard
   // sees log lines in real time instead of after process exit.
-  const child = spawn(pythonBin, ["agents/run_pipeline.py"], {
+  // laptop_bootstrap.py provisions the pod, SCPs code + secrets, and starts
+  // the pod-side orchestrator inside a screen session. After it exits, the
+  // pod runs autonomously — laptop can disconnect entirely.
+  const child = spawn(pythonBin, ["agents/laptop_bootstrap.py"], {
     cwd: SCRIPTS,
     detached: true,
     stdio: ["ignore", logFd, logFd],
