@@ -100,6 +100,11 @@ export async function POST() {
     if (asset.name === "plant_classifier_deep_learning.tflite") {
       fs.writeFileSync(path.join(RESULTS, asset.name), buf);
     }
+    // Same for the AI suggestion — top-level copy makes /api/results/
+    // suggested-hyperparameters a fast O(1) read on next start.
+    if (asset.name === "suggested_hyperparameters.json") {
+      fs.writeFileSync(path.join(RESULTS, "last_suggested_hyperparameters.json"), buf);
+    }
   }
 
   // Mutate pipeline_state.json so subsequent page loads pick up "done" automatically.

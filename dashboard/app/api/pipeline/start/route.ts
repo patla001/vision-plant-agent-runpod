@@ -40,12 +40,32 @@ function resolvePython(): string | null {
   return null;
 }
 
+// Hyperparameter fields the dashboard is allowed to override per-run.
+// The full schema is defined in DeepLearning-tensorFlowLite/model_hyperparameters.json
+// under deep_learning; we accept the four most-tunable values + ignore the rest
+// so a typo in the UI doesn't silently break training.
+const ALLOWED_HP_KEYS = ["epochs", "learning_rate", "dropout", "early_stopping_patience"] as const;
+
+function sanitizeHyperparameters(raw: unknown): Record<string, number> | null {
+  if (raw === null || typeof raw !== "object") return null;
+  const out: Record<string, number> = {};
+  for (const k of ALLOWED_HP_KEYS) {
+    const v = (raw as Record<string, unknown>)[k];
+    if (typeof v === "number" && Number.isFinite(v)) {
+      out[k] = v;
+    }
+  }
+  return Object.keys(out).length > 0 ? out : null;
+}
+
 export async function POST(req: NextRequest) {
-  // Optional body: { color_correct?: "none" | "gray_world" | "max_rgb" }
-  // Falls back to model_hyperparameters.json's deep_learning.color_correct
-  // when omitted or empty. Reject unknown values explicitly so a typo from
-  // a future UI change doesn't silently fall through.
-  let colorCorrect: ColorCorrect | null = null;
+  // Optional body: {
+  //   color_correct?: "none" | "gray_world" | "max_rgb",
+  //   hyperparameters?: { epochs?, learning_rate?, dropout?, early_stopping_patience? }
+  // }
+  // Anything else falls back to model_hyperparameters.json's defaults.
+  let colorCorrect:    ColorCorrect | null = null;
+  let hyperparameters: Record<string, number> | null = null;
   try {
     const body = await req.json().catch(() => ({}));
     const raw = typeof body?.color_correct === "string" ? body.color_correct : "";
@@ -57,6 +77,7 @@ export async function POST(req: NextRequest) {
       }
       colorCorrect = raw as ColorCorrect;
     }
+    hyperparameters = sanitizeHyperparameters(body?.hyperparameters);
   } catch { /* no body — fine */ }
 
   // Verify Python is callable before doing anything else
@@ -99,7 +120,8 @@ export async function POST(req: NextRequest) {
       ...process.env,
       PYTHONDONTWRITEBYTECODE: "1",
       PYTHONUNBUFFERED:        "1",
-      ...(colorCorrect ? { PIPELINE_COLOR_CORRECT: colorCorrect } : {}),
+      ...(colorCorrect    ? { PIPELINE_COLOR_CORRECT: colorCorrect }                   : {}),
+      ...(hyperparameters ? { PIPELINE_HYPERPARAMETERS: JSON.stringify(hyperparameters) } : {}),
     },
   });
   child.unref();

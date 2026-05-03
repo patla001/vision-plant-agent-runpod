@@ -49,6 +49,7 @@ import requests
 
 import analysis_agent
 import github_release_tool
+import hyperparameter_suggester
 import runpod_api
 from base_agent import run_agent_loop
 from _logging import log as _log
@@ -59,10 +60,17 @@ _SYSTEM = """You are the Pod Orchestrator Agent for the CS659 plant-classificati
 You run ON the training pod itself, in a screen session, AFTER training has completed.
 Your job is to wrap up the run autonomously so the user doesn't need their laptop online:
 
-  1. analyze_results       — delegate to the AnalysisAgent for an interpretation report.
-  2. create_github_release — package the .tflite + plots + metrics CSVs + report into a
-                             tagged GitHub Release so results survive pod termination.
-  3. self_terminate        — terminate this pod via RunPod's API. Stops billing immediately.
+  1. analyze_results          — delegate to the AnalysisAgent for an interpretation report.
+  2. suggest_hyperparameters  — diagnose overfit/underfit and write
+                                suggested_hyperparameters.json so the user can pick it up
+                                on their next run. Always call this even if the run looks
+                                well-fit — the suggester will return diagnosis="well_fit"
+                                with no changes.
+  3. create_github_release    — package the .tflite + plots + CSVs + analysis report +
+                                suggested_hyperparameters.json into a tagged GitHub Release.
+                                This MUST come AFTER the suggestion so the file is on
+                                disk and gets uploaded.
+  4. self_terminate           — terminate this pod via RunPod's API. Stops billing.
 
 Rules:
 - ALWAYS call create_github_release BEFORE self_terminate. Once the pod terminates,
@@ -70,7 +78,7 @@ Rules:
 - If create_github_release fails, retry once. If it still fails, log loudly and
   call self_terminate anyway — leaving the pod running indefinitely costs more
   than losing the run.
-- Don't skip analyze_results. The Release should include the analysis report.
+- Don't skip analyze_results or suggest_hyperparameters. Both feed downstream UX.
 - After self_terminate, exit — the pod will disappear within ~30 seconds.
 """
 
@@ -80,6 +88,15 @@ _TOOLS = [
         "description": (
             "Delegate to the AnalysisAgent (Claude Opus 4.7). It reads the training "
             "results in --results_dir, writes analysis_report.md, and returns a summary string."
+        ),
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "suggest_hyperparameters",
+        "description": (
+            "Single-turn Claude call that diagnoses the model as overfit / underfit / well-fit "
+            "and writes results_dir/suggested_hyperparameters.json with at most 3 small tunings. "
+            "Returns a short summary."
         ),
         "input_schema": {"type": "object", "properties": {}, "required": []},
     },
@@ -128,6 +145,53 @@ def make_executor(client: anthropic.Anthropic, results_dir: Path, run_tag: str, 
                 os.chdir(old)
             _log("PodOrchestrator", f"Analysis complete ({len(report)} chars).")
             return report
+
+        if name == "suggest_hyperparameters":
+            _log("PodOrchestrator", "Computing hyperparameter suggestion ...")
+            # Read the deep_learning section from the cloned hyperparameter file
+            # (or the override that pod_setup.sh applied) so the suggester sees
+            # exactly what trained this run.
+            cfg_paths = [
+                Path("/workspace/cs659/DeepLearning-tensorFlowLite/model_hyperparameters.json"),
+                Path("/workspace/hyperparameters_override.json"),
+            ]
+            current_dl: dict = {}
+            for p in cfg_paths:
+                if p.exists():
+                    try:
+                        full = json.loads(p.read_text())
+                        current_dl = full.get("deep_learning", full) if isinstance(full, dict) else {}
+                        break
+                    except json.JSONDecodeError:
+                        continue
+            try:
+                payload = hyperparameter_suggester.suggest(
+                    client=client,
+                    results_dir=results_dir,
+                    current_hyperparameters=current_dl,
+                    run_tag=run_tag,
+                )
+            except Exception as exc:
+                _log("PodOrchestrator", f"Hyperparameter suggestion failed: {exc}")
+                # Don't abort — write a stub so downstream consumers can still
+                # see that we tried, and so the upload step doesn't surprise
+                # us with a missing file.
+                stub = {
+                    "diagnosis":             "unknown",
+                    "reasoning":             f"Suggestion failed: {type(exc).__name__}: {exc}",
+                    "suggested_hyperparameters": {},
+                    "expected_improvement":  "n/a",
+                    "based_on_run":          run_tag,
+                    "produced_at":           datetime.now(timezone.utc).isoformat(),
+                    "current_hyperparameters": current_dl,
+                }
+                (results_dir / "suggested_hyperparameters.json").write_text(json.dumps(stub, indent=2) + "\n")
+                return f"Suggestion failed and stub written: {exc}"
+            return (
+                f"Diagnosis: {payload['diagnosis']}. "
+                f"Suggested {len(payload['suggested_hyperparameters'])} change(s). "
+                f"Reasoning: {payload['reasoning'][:200]}"
+            )
 
         if name == "create_github_release":
             if not gh_token:
@@ -233,7 +297,8 @@ def main() -> None:
         initial_message=(
             f"Training has completed successfully. Run tag: {args.run_tag}.\n"
             f"Results directory: {args.results_dir}.\n"
-            "Proceed: analyze_results → create_github_release → self_terminate."
+            "Proceed: analyze_results → suggest_hyperparameters → "
+            "create_github_release → self_terminate."
         ),
         tool_executor=make_executor(client, args.results_dir, args.run_tag, args.repo_dir),
         model="claude-opus-4-7",

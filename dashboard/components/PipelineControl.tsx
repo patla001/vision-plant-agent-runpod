@@ -78,6 +78,61 @@ export default function PipelineControl({ initialState, onResultsReady }: Props)
   const [startError, setStartError] = useState<string | null>(null);
   const [colorCorrect, setColorCorrect] = useState<"none" | "gray_world" | "max_rgb">("none");
 
+  // Hyperparameter source on the home page. "default" uses the JSON in the
+  // repo. "ai" pulls the latest AI suggestion from /api/results/...; falls
+  // back to "default" silently if no suggestion exists. "manual" exposes
+  // editable inputs.
+  type HpMode = "default" | "ai" | "manual";
+  const [hpMode, setHpMode] = useState<HpMode>("default");
+  const [aiSuggestion, setAiSuggestion] = useState<{
+    diagnosis?:   string;
+    reasoning?:   string;
+    suggested_hyperparameters?: Record<string, number>;
+    expected_improvement?: string;
+    based_on_run?: string;
+    error?:       string;
+  } | null>(null);
+  const [manualHp, setManualHp] = useState<{
+    epochs:                   string;
+    learning_rate:            string;
+    dropout:                  string;
+    early_stopping_patience:  string;
+  }>({ epochs: "", learning_rate: "", dropout: "", early_stopping_patience: "" });
+
+  // Lazy-load the AI suggestion when the user picks that mode for the first time.
+  useEffect(() => {
+    if (hpMode !== "ai" || aiSuggestion !== null) return;
+    fetch("/api/results/suggested-hyperparameters")
+      .then(async (r) => {
+        if (r.status === 404) {
+          setAiSuggestion({ error: "No prior AI suggestion found — first run will use defaults." });
+          return;
+        }
+        if (!r.ok) {
+          setAiSuggestion({ error: `Failed to fetch suggestion (HTTP ${r.status})` });
+          return;
+        }
+        setAiSuggestion(await r.json());
+      })
+      .catch((e) => setAiSuggestion({ error: e instanceof Error ? e.message : String(e) }));
+  }, [hpMode, aiSuggestion]);
+
+  /** Build the hyperparameters payload for the start request based on the picked mode. */
+  const buildHyperparameters = useCallback((): Record<string, number> | null => {
+    if (hpMode === "default") return null;
+    if (hpMode === "ai") {
+      return aiSuggestion?.suggested_hyperparameters ?? null;
+    }
+    // manual: parse non-empty fields as numbers
+    const out: Record<string, number> = {};
+    for (const [k, v] of Object.entries(manualHp)) {
+      if (v.trim() === "") continue;
+      const n = Number(v);
+      if (Number.isFinite(n)) out[k] = n;
+    }
+    return Object.keys(out).length > 0 ? out : null;
+  }, [hpMode, aiSuggestion, manualHp]);
+
   useEffect(() => {
     if (state.status !== "running") return;
     const id = setInterval(async () => {
@@ -155,11 +210,14 @@ export default function PipelineControl({ initialState, onResultsReady }: Props)
       // Best-effort abort — fine if there's no pod to terminate.
       try { await fetch("/api/pipeline/abort", { method: "POST" }); } catch { /* ignore */ }
       await fetch("/api/pipeline/reset",  { method: "POST" });
-      // Re-call start with the current colorCorrect selection
+      // Re-call start with the current colorCorrect + hyperparameter selection
       const startRes = await fetch("/api/pipeline/start", {
         method:  "POST",
         headers: { "Content-Type": "application/json" },
-        body:    JSON.stringify({ color_correct: colorCorrect }),
+        body:    JSON.stringify({
+          color_correct:   colorCorrect,
+          hyperparameters: buildHyperparameters(),
+        }),
       });
       const startBody = await startRes.json();
       if (!startRes.ok) {
@@ -173,7 +231,7 @@ export default function PipelineControl({ initialState, onResultsReady }: Props)
     } finally {
       setFreshStarting(false);
     }
-  }, [colorCorrect]);
+  }, [colorCorrect, buildHyperparameters]);
 
   // When poll-pod reports the run is done, sync local results so the rich
   // results dashboard (TrainingCurves, ConfusionMatrix, etc.) works.
@@ -198,10 +256,14 @@ export default function PipelineControl({ initialState, onResultsReady }: Props)
     setStarting(true);
     setStartError(null);
     try {
+      const hp = buildHyperparameters();
       const res  = await fetch("/api/pipeline/start", {
         method:  "POST",
         headers: { "Content-Type": "application/json" },
-        body:    JSON.stringify({ color_correct: colorCorrect }),
+        body:    JSON.stringify({
+          color_correct:   colorCorrect,
+          hyperparameters: hp,
+        }),
       });
       const data = await res.json();
       if (!res.ok) { setStartError(data.error ?? "Failed to start"); setStarting(false); return; }
@@ -212,7 +274,7 @@ export default function PipelineControl({ initialState, onResultsReady }: Props)
     } finally {
       setStarting(false);
     }
-  }, [colorCorrect]);
+  }, [colorCorrect, buildHyperparameters]);
 
   const [aborting, setAborting] = useState(false);
   const handleAbort = useCallback(async () => {
@@ -429,6 +491,106 @@ export default function PipelineControl({ initialState, onResultsReady }: Props)
           <p className="text-[11px] text-slate-500 leading-relaxed">
             Applied to images at training time. Inference must use the same value.
           </p>
+        </div>
+
+        {/* Hyperparameter source picker */}
+        <div className="glass rounded-2xl p-4 w-full max-w-md text-left space-y-3">
+          <p className="text-xs font-semibold text-slate-400 uppercase tracking-widest">
+            Hyperparameters
+          </p>
+          <div className="grid grid-cols-3 gap-2 text-xs">
+            {(["default", "ai", "manual"] as const).map((m) => (
+              <button
+                key={m}
+                onClick={() => setHpMode(m)}
+                disabled={starting}
+                className={`px-3 py-2 rounded-lg border transition ${
+                  hpMode === m
+                    ? "border-cyan-400 bg-cyan-500/10 text-cyan-300"
+                    : "border-slate-700 text-slate-400 hover:border-slate-500"
+                }`}
+              >
+                {m === "default" ? "Default" : m === "ai" ? "AI suggested" : "Manual"}
+              </button>
+            ))}
+          </div>
+
+          {hpMode === "default" && (
+            <p className="text-[11px] text-slate-500 leading-relaxed">
+              Use the values committed in <code className="font-mono">model_hyperparameters.json</code>.
+              Same as starting without picking anything.
+            </p>
+          )}
+
+          {hpMode === "ai" && (
+            <div className="space-y-2 text-xs">
+              {!aiSuggestion && <p className="text-slate-500">Loading suggestion…</p>}
+              {aiSuggestion?.error && (
+                <p className="text-amber-400">{aiSuggestion.error}</p>
+              )}
+              {aiSuggestion?.diagnosis && (
+                <>
+                  <p>
+                    <span className="text-slate-500">Diagnosis: </span>
+                    <span className={
+                      aiSuggestion.diagnosis === "overfitting"  ? "text-amber-300" :
+                      aiSuggestion.diagnosis === "underfitting" ? "text-violet-300" :
+                                                                 "text-emerald-300"
+                    }>{aiSuggestion.diagnosis}</span>
+                  </p>
+                  {aiSuggestion.reasoning && (
+                    <p className="text-slate-400 leading-relaxed">{aiSuggestion.reasoning}</p>
+                  )}
+                  {aiSuggestion.suggested_hyperparameters && Object.keys(aiSuggestion.suggested_hyperparameters).length > 0 ? (
+                    <div className="bg-slate-900/60 border border-slate-700 rounded-lg p-2">
+                      <p className="text-[10px] uppercase tracking-widest text-slate-500 mb-1">Suggested changes</p>
+                      <ul className="space-y-0.5">
+                        {Object.entries(aiSuggestion.suggested_hyperparameters).map(([k, v]) => (
+                          <li key={k} className="font-mono text-cyan-300">
+                            {k}: <span className="text-slate-200">{String(v)}</span>
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  ) : (
+                    <p className="text-slate-500">Suggester returned no changes — defaults will apply.</p>
+                  )}
+                  {aiSuggestion.based_on_run && (
+                    <p className="text-[10px] text-slate-600 font-mono">based on {aiSuggestion.based_on_run}</p>
+                  )}
+                </>
+              )}
+            </div>
+          )}
+
+          {hpMode === "manual" && (
+            <div className="space-y-2">
+              <p className="text-[11px] text-slate-500">
+                Leave blank to keep the JSON default for that field.
+              </p>
+              <div className="grid grid-cols-2 gap-2 text-xs">
+                {(["epochs", "learning_rate", "dropout", "early_stopping_patience"] as const).map((k) => (
+                  <label key={k} className="flex flex-col gap-1">
+                    <span className="text-slate-500 font-mono">{k}</span>
+                    <input
+                      type="text"
+                      inputMode="decimal"
+                      value={manualHp[k]}
+                      onChange={(e) => setManualHp((p) => ({ ...p, [k]: e.target.value }))}
+                      disabled={starting}
+                      placeholder={
+                        k === "epochs" ? "25" :
+                        k === "learning_rate" ? "0.0001" :
+                        k === "dropout" ? "0.2" :
+                                          "5"
+                      }
+                      className="bg-slate-900/60 border border-slate-700 rounded px-2 py-1 text-slate-200 focus:outline-none focus:border-cyan-400 font-mono"
+                    />
+                  </label>
+                ))}
+              </div>
+            </div>
+          )}
         </div>
 
         {startError && (
