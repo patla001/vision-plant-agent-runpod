@@ -19,9 +19,11 @@ querying the RunPod API + GitHub Releases to determine current state.
 """
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -32,6 +34,7 @@ SCRIPTS_DIR   = REPO_ROOT / "scripts"
 DL_DIR        = REPO_ROOT / "DeepLearning-tensorFlowLite"
 ENV_FILE      = REPO_ROOT / ".env"
 LOCAL_RESULTS = REPO_ROOT / "results"
+HYPERPARAMS_JSON = DL_DIR / "model_hyperparameters.json"
 
 load_dotenv(ENV_FILE)
 
@@ -97,6 +100,28 @@ def main() -> None:
               file=sys.stderr)
         sys.exit(1)
 
+    # PIPELINE_HYPERPARAMETERS, if set, is a JSON dict of deep_learning keys to override.
+    # Already validated/sanitized by the dashboard's start route (only allowed keys reach
+    # us). Merged into the local model_hyperparameters.json's deep_learning section, then
+    # SCP'd to the pod as /workspace/hyperparameters_override.json. pod_setup.sh applies
+    # the override to the cloned repo's JSON before training.
+    hp_override_path: Path | None = None
+    hp_env = os.environ.get("PIPELINE_HYPERPARAMETERS")
+    if hp_env:
+        try:
+            overrides = json.loads(hp_env)
+            base = json.loads(HYPERPARAMS_JSON.read_text())
+            base.setdefault("deep_learning", {}).update(overrides)
+            tmp = tempfile.NamedTemporaryFile(
+                "w", delete=False, suffix=".json", prefix="hp_override_")
+            tmp.write(json.dumps(base, indent=2) + "\n")
+            tmp.flush()
+            tmp.close()
+            hp_override_path = Path(tmp.name)
+        except (json.JSONDecodeError, OSError) as exc:
+            print(f"Error: PIPELINE_HYPERPARAMETERS could not be applied: {exc}", file=sys.stderr)
+            sys.exit(1)
+
     # Run tag (UTC, second precision; safe for both filesystem and GitHub tag names)
     run_tag = "run-" + datetime.now(timezone.utc).strftime("%Y-%m-%dT%H-%M-%SZ")
 
@@ -140,6 +165,12 @@ def main() -> None:
         _scp_dir(ip, port, SCRIPTS_DIR / "agents",            "/workspace/agents")
         _scp(ip, port, SCRIPTS_DIR / "runpod_api.py",         "/workspace/runpod_api.py")
         _scp(ip, port, SCRIPTS_DIR / "requirements.txt",      "/workspace/agent-requirements.txt")
+        # Per-run hyperparameter override (only when the user picked AI-suggested
+        # or Manual on the home page). pod_setup.sh copies this over the cloned
+        # repo's model_hyperparameters.json before training.
+        if hp_override_path is not None:
+            _scp(ip, port, hp_override_path, "/workspace/hyperparameters_override.json")
+            print(f"Hyperparameter override uploaded to /workspace/hyperparameters_override.json")
         # Lock down .env so it isn't world-readable on shared image layers.
         _ssh(ip, port, "chmod 600 /workspace/.env", timeout=20)
 

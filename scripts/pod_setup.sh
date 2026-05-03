@@ -105,6 +105,19 @@ else
   log "Flatten already done at $FLAT_DIR ($(ls "$FLAT_DIR" | wc -l) classes) — skipping"
 fi
 
+# ── 5b. Apply hyperparameter override (if user picked AI suggestion / manual) ──
+# laptop_bootstrap.py SCPs a fully-merged model_hyperparameters.json here when
+# the user overrides defaults via the dashboard's home-page picker. We replace
+# the cloned repo's copy so train_export_tflite.py reads the override values.
+HP_OVERRIDE="$WORKSPACE/hyperparameters_override.json"
+HP_TARGET="$REPO_DIR/DeepLearning-tensorFlowLite/model_hyperparameters.json"
+if [ -f "$HP_OVERRIDE" ]; then
+  log "Applying hyperparameter override from $HP_OVERRIDE"
+  cp "$HP_OVERRIDE" "$HP_TARGET"
+else
+  log "No hyperparameter override — using defaults from cloned repo"
+fi
+
 # ── 6. Train (synchronous in this screen session) ─────────────────────────────
 mkdir -p "$RESULTS_DIR"
 
