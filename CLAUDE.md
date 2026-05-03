@@ -32,41 +32,50 @@ CS659 multi-agent ML pipeline that trains a MobileNetV2 plant classifier on Plan
 
 ## Architecture
 
-### The agent dispatch model
+### Pod-side detached run model
+
+The orchestrator runs **on the training pod itself**, inside a `screen` session, so the user's laptop can shut down anytime after the bootstrap completes.
 
 ```
 User clicks Start
     ↓
-Dashboard → POST /api/pipeline/start → spawns python agents/run_pipeline.py
+Dashboard → POST /api/pipeline/start → spawns laptop_bootstrap.py
     ↓
-OrchestratorAgent (Opus 4.7) — has 8 tools, runs the full lifecycle
-    ├── tool: provision_pod          → calls runpod_api.create_pod
-    ├── tool: wait_for_pod_ready     → polls until SSH port opens
-    ├── tool: launch_training        → SCP scripts to pod, run pod_setup.sh
-    ├── tool: check_training_status  → SPAWNS MonitorAgent (Haiku 4.5) as subagent
-    ├── tool: wait_minutes           → time.sleep between status checks
-    ├── tool: download_results       → rsync /workspace/results to local
-    ├── tool: terminate_pod          → calls runpod_api.terminate_pod
-    └── tool: analyze_results        → SPAWNS AnalysisAgent (Opus 4.7) as subagent
+laptop_bootstrap.py (NOT a Claude agent — pure Python):
+    1. provision pod via runpod_api.create_pod
+    2. wait for SSH
+    3. SCP .env, agents/, pod_setup.sh, training_wrapper.py to pod
+    4. SSH: `setsid env RUN_TAG=... screen -dmS cs659 bash /workspace/pod_setup.sh`
+    5. write pipeline_state.json with status="running-on-pod"
+    6. exit (laptop free to disconnect)
+        ↓
+pod_setup.sh (running in screen 'cs659' on pod):
+    1. apt + pip installs (training + agent reqs)
+    2. wget + unzip + flatten PlantNet-300K
+    3. python training_wrapper.py (foreground; writes DONE when complete)
+    4. python pod_orchestrator.py
+        ↓
+PodOrchestratorAgent (Opus 4.7, ON THE POD):
+    ├── tool: analyze_results       → SPAWNS AnalysisAgent (Opus 4.7) as subagent
+    ├── tool: create_github_release → uploads .tflite + plots + CSVs as Release assets
+    └── tool: self_terminate        → calls RunPod GraphQL podTerminate on its own pod_id
 ```
 
-Subagents are spawned by their parent's tool implementation as separate `client.messages.create()` calls. They have their own focused tools, system prompts, and iteration limits.
+Two Claude agents in the loop now: the pod orchestrator and the analysis subagent. The previous laptop-side `MonitorAgent` is gone — the pod-side orchestrator reads local files directly so SSH-based monitoring isn't needed.
 
-### Why three different models
+### Reattach flow (user comes back hours later)
 
-| Agent | Model | Reason |
-|-------|-------|--------|
-| Orchestrator | `claude-opus-4-7` | High-stakes decisions — mistakes cost RunPod money |
-| Monitor | `claude-haiku-4-5` | Simple SSH status checks, cheapest model |
-| Analysis | `claude-opus-4-7` | Real reasoning over numerical results |
+Dashboard on load:
+1. Reads `pipeline_state.json` for `pod_id` + `run_tag`
+2. Calls `/api/pipeline/poll-pod` which combines:
+   - RunPod GraphQL: is the pod still alive?
+   - GitHub API: does Release `<run_tag>` exist?
+3. Renders a status panel: bootstrapping / training / uploading / done / unknown
+4. When state is "done", a Sync button calls `/api/pipeline/sync-release` to download all Release assets to local `results/<run_tag>/`, then transitions the dashboard to the regular results view (TrainingCurves, ConfusionMatrix, etc.)
 
 ### State persistence
 
-All inter-process state lives in two files in `results/`:
-- `pipeline_state.json` — current step, status, errors, pod ID. Written atomically by Python via temp-file rename.
-- `pipeline.log` — Python subprocess stdout/stderr.
-
-The dashboard reads both via `/api/pipeline/status` (polled every 10 s) and `/api/pipeline/logs` (SSE every 2 s). Closing the browser tab does not interrupt the pipeline — state survives.
+`results/pipeline_state.json` is the source of truth on the local laptop. It carries `pod_id`, `run_tag`, `pod_ip`, `pod_port`, `screen_session`, `color_correct`, `status`. The dashboard polls `/api/pipeline/status` (local-only) and `/api/pipeline/poll-pod` (RunPod + GitHub). The pod-side orchestrator does NOT write to this file — once the pod is detached, the only durable state is the GitHub Release.
 
 ## Common Commands
 
@@ -79,7 +88,8 @@ cd dashboard && pnpm typecheck                 # TypeScript check
 **Run the pipeline manually (without dashboard):**
 ```bash
 cd scripts && pip install -r requirements.txt
-python agents/run_pipeline.py                  # requires .env with both API keys
+python agents/laptop_bootstrap.py               # requires .env with all 3 keys
+# (Legacy laptop-resident orchestrator: agents/run_pipeline.py — kept for reference, not used by dashboard)
 ```
 
 **Run the tests:**

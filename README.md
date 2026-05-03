@@ -73,7 +73,8 @@ cd scripts && pip install -r requirements.txt
 
 # Configure secrets
 cd .. && cp .env.example .env
-# Edit .env to fill in RUNPOD_API_KEY and ANTHROPIC_API_KEY
+# Edit .env to fill in RUNPOD_API_KEY, ANTHROPIC_API_KEY, and GITHUB_TOKEN
+# (GitHub PAT with `contents: write` on this repo — see .env.example)
 ```
 
 **Run:**

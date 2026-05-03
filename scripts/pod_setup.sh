@@ -1,8 +1,19 @@
 #!/usr/bin/env bash
-# Runs ON the RunPod pod (uploaded by orchestrator's launch_training tool,
-# then executed via nohup so SSH returns immediately).
-# Downloads PlantNet-300K, sets up the repo, flattens the dataset,
-# then launches the CNN training inside a detached screen session.
+# Runs ON the RunPod pod, inside the `cs659` screen session launched by
+# laptop_bootstrap.py. Owns the entire pod lifecycle synchronously:
+#   1. Install system + Python deps
+#   2. Download + unzip + flatten PlantNet-300K
+#   3. Train (foreground in this same screen)
+#   4. Hand off to pod_orchestrator.py for analysis + GitHub upload + self-terminate
+#
+# After this script returns, the pod_orchestrator has self-terminated the pod.
+# The screen session ends naturally; the pod disappears within ~30s.
+#
+# Required env (exported by laptop_bootstrap.py via `env VAR=... screen ...`):
+#   RUN_TAG          — tag for the GitHub Release (e.g. run-2026-05-03T19-22Z)
+#   COLOR_CORRECT    — optional: none|gray_world|max_rgb (overrides JSON default)
+# Loaded from /workspace/.env (SCP'd by bootstrap):
+#   ANTHROPIC_API_KEY, RUNPOD_API_KEY, GITHUB_TOKEN
 set -euo pipefail
 
 WORKSPACE=/workspace
@@ -13,18 +24,34 @@ FLAT_DIR="$WORKSPACE/plantnet_flat"
 RESULTS_DIR="$WORKSPACE/results"
 REPO_DIR="$WORKSPACE/cs659"
 DONE_FILE="$WORKSPACE/DONE"
+AGENTS_DIR="$WORKSPACE/agents"
 
 log() { echo "[$(date -u '+%Y-%m-%d %H:%M:%S UTC')] $*"; }
 
+# Source .env so subsequent processes inherit ANTHROPIC_API_KEY, GITHUB_TOKEN, etc.
+if [ -f "$WORKSPACE/.env" ]; then
+  set -a
+  # shellcheck disable=SC1091
+  . "$WORKSPACE/.env"
+  set +a
+  log ".env loaded ($(grep -c '^[A-Z_]\+=' "$WORKSPACE/.env" || true) vars)"
+else
+  log "WARNING: /workspace/.env not found — pod_orchestrator will fail."
+fi
+
+# RUN_TAG must be present — bootstrap should have exported it.
+if [ -z "${RUN_TAG:-}" ]; then
+  log "FATAL: RUN_TAG env var missing. Aborting."
+  exit 1
+fi
+log "Run tag: $RUN_TAG"
+
 # ── 0. Install required system tools ──────────────────────────────────────────
-# Some RunPod images (including the pytorch:2.4.0-py3.11-cuda12.4.1 image we
-# use) ship without `screen` or `rsync`. Install them upfront before any code
-# tries to use them. apt-get is always present on Ubuntu-based RunPod images.
-log "Installing required system tools (screen, rsync, wget, unzip, git) …"
+log "Installing system tools (rsync, wget, unzip, git) …"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-apt-get install -y -qq screen rsync wget unzip git
-log "System tools installed: screen=$(command -v screen) rsync=$(command -v rsync)"
+apt-get install -y -qq rsync wget unzip git
+# screen was installed by the bootstrap before we got here.
 
 # ── 1. Download PlantNet-300K ──────────────────────────────────────────────────
 log "Downloading PlantNet-300K (31.7 GB) …"
@@ -36,65 +63,65 @@ wget -q --show-progress \
 log "Unzipping …"
 cd "$WORKSPACE"
 unzip -q "$DATA_ZIP"
-rm -f "$DATA_ZIP"   # free 32 GB immediately after extraction
+rm -f "$DATA_ZIP"
 log "Unzip complete — $(du -sh "$DATA_DIR" | cut -f1) on disk"
 
-# ── 3. Clone repo ─────────────────────────────────────────────────────────────
+# ── 3. Clone repo (for training scripts that aren't SCP'd individually) ───────
 log "Cloning repo …"
 git clone --depth=1 "$REPO_URL" "$REPO_DIR"
 
-# ── 4. Install Python deps ────────────────────────────────────────────────────
-log "Installing Python dependencies …"
+# ── 4a. Install training Python deps ──────────────────────────────────────────
+log "Installing training Python deps (TensorFlow + sklearn) …"
 pip install -q -r "$REPO_DIR/DeepLearning-tensorFlowLite/requirements-tflite.txt"
 
 # ── 4b. Install GPU-bundled TensorFlow extras (CuDNN, cuBLAS, etc.) ──────────
-# The plain `tensorflow` wheel relies on whatever CuDNN is installed on the
-# system. The runpod/pytorch base image ships CuDNN 9.1.0, but recent TF
-# wheels (2.18+) are compiled against CuDNN 9.3.0, causing:
-#   "Loaded runtime CuDNN library: 9.1.0 but source was compiled with: 9.3.0
-#    DNN library initialization failed."
-#
-# `tensorflow[and-cuda]` adds nvidia-cudnn-cu12 + nvidia-cublas-cu12 + the
-# rest of the NVIDIA Python packages, which match TensorFlow's compile-time
-# version. TF preferentially loads these from site-packages over the system
-# CuDNN, fixing the mismatch.
-log "Installing tensorflow[and-cuda] extras (nvidia-cudnn, cublas, etc.) …"
+log "Installing tensorflow[and-cuda] extras …"
 pip install -q --upgrade "tensorflow[and-cuda]"
-log "GPU libraries installed:"
-pip list 2>/dev/null | grep -iE "tensorflow|nvidia-cudnn|nvidia-cublas" | head
 
-# ── 5. Flatten dataset using symlinks (saves ~35 GB vs. copies) ───────────────
+# ── 4c. Install agent deps (anthropic + requests + python-dotenv) ─────────────
+log "Installing agent Python deps …"
+pip install -q -r "$WORKSPACE/agent-requirements.txt"
+
+# ── 5. Flatten dataset using symlinks ─────────────────────────────────────────
 log "Flattening dataset (symlinks) …"
 mkdir -p "$FLAT_DIR"
 python "$REPO_DIR/DeepLearning-tensorFlowLite/flatten_plantnet.py" \
   --source "$DATA_DIR/images" \
   --out    "$FLAT_DIR" \
   --splits train,val,test \
-  --min-images 10   # drop classes with <10 total images
-
+  --min-images 10
 log "Flatten complete — $(ls "$FLAT_DIR" | wc -l) species classes"
 
-# ── 6. Launch CNN training in a detached screen session ───────────────────────
+# ── 6. Train (synchronous in this screen session) ─────────────────────────────
 mkdir -p "$RESULTS_DIR"
-log "Starting CNN training in screen session 'train_cnn' …"
 
-# COLOR_CORRECT is set by the orchestrator's launch_training tool when the user
-# selected a non-default value in the dashboard. Empty → JSON default applies.
 CC_FLAG=""
 if [ -n "${COLOR_CORRECT:-}" ]; then
   CC_FLAG="--color_correct $COLOR_CORRECT"
   log "Color correction override: $COLOR_CORRECT"
 fi
 
-screen -dmS train_cnn bash -c "
-  cd $REPO_DIR/DeepLearning-tensorFlowLite
-  python training_wrapper.py \
-    --data_dir $FLAT_DIR \
-    --result_dir $RESULTS_DIR \
-    --done_file $DONE_FILE \
-    $CC_FLAG \
-    2>&1 | tee $RESULTS_DIR/training.log
-"
+log "Starting CNN training (foreground) …"
+cd "$REPO_DIR/DeepLearning-tensorFlowLite"
+python training_wrapper.py \
+  --data_dir   "$FLAT_DIR" \
+  --result_dir "$RESULTS_DIR" \
+  --done_file  "$DONE_FILE" \
+  $CC_FLAG \
+  2>&1 | tee "$RESULTS_DIR/training.log"
 
-log "Screen session started. Monitor with: screen -r train_cnn"
-log "Training log: $RESULTS_DIR/training.log"
+log "Training finished. Handing off to pod_orchestrator.py …"
+
+# ── 7. Pod orchestrator: analysis → GitHub Release → self-terminate ──────────
+# Run from /workspace/agents so sibling imports (base_agent, analysis_agent,
+# github_release_tool, runpod_api) all resolve via the same sys.path entries
+# the script adds at startup.
+cd "$AGENTS_DIR"
+PYTHONPATH="$AGENTS_DIR:$WORKSPACE" python pod_orchestrator.py \
+  --results_dir "$RESULTS_DIR" \
+  --done_file   "$DONE_FILE" \
+  --run_tag     "$RUN_TAG" \
+  --repo_dir    "$REPO_DIR" \
+  2>&1 | tee "$RESULTS_DIR/orchestrator.log"
+
+log "pod_setup.sh complete. Pod should self-terminate momentarily."
