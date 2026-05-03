@@ -53,22 +53,31 @@ apt-get update -qq
 apt-get install -y -qq rsync wget unzip git
 # screen was installed by the bootstrap before we got here.
 
-# ── 1. Download PlantNet-300K ──────────────────────────────────────────────────
-log "Downloading PlantNet-300K (31.7 GB) …"
-wget -q --show-progress \
-  "https://zenodo.org/records/5645731/files/plantnet_300K.zip?download=1" \
-  -O "$DATA_ZIP"
+# ── 1+2. Download + unzip PlantNet-300K (idempotent) ──────────────────────────
+# Skipped on restart-training when the dataset directory is already present.
+# Saves ~15 minutes of wget when the user clicks "Restart training on same pod".
+if [ ! -d "$DATA_DIR" ]; then
+  log "Downloading PlantNet-300K (31.7 GB) …"
+  wget -q --show-progress \
+    "https://zenodo.org/records/5645731/files/plantnet_300K.zip?download=1" \
+    -O "$DATA_ZIP"
+  log "Unzipping …"
+  cd "$WORKSPACE"
+  unzip -q "$DATA_ZIP"
+  rm -f "$DATA_ZIP"
+  log "Unzip complete — $(du -sh "$DATA_DIR" | cut -f1) on disk"
+else
+  log "Dataset already at $DATA_DIR ($(du -sh "$DATA_DIR" | cut -f1)) — skipping download/unzip"
+fi
 
-# ── 2. Unzip ───────────────────────────────────────────────────────────────────
-log "Unzipping …"
-cd "$WORKSPACE"
-unzip -q "$DATA_ZIP"
-rm -f "$DATA_ZIP"
-log "Unzip complete — $(du -sh "$DATA_DIR" | cut -f1) on disk"
-
-# ── 3. Clone repo (for training scripts that aren't SCP'd individually) ───────
-log "Cloning repo …"
-git clone --depth=1 "$REPO_URL" "$REPO_DIR"
+# ── 3. Clone repo (idempotent — pull if already cloned) ──────────────────────
+if [ ! -d "$REPO_DIR/.git" ]; then
+  log "Cloning repo …"
+  git clone --depth=1 "$REPO_URL" "$REPO_DIR"
+else
+  log "Repo already cloned — pulling latest"
+  git -C "$REPO_DIR" pull --ff-only --quiet || log "git pull failed (using existing tree)"
+fi
 
 # ── 4a. Install training Python deps ──────────────────────────────────────────
 log "Installing training Python deps (TensorFlow + sklearn) …"
@@ -82,15 +91,19 @@ pip install -q --upgrade "tensorflow[and-cuda]"
 log "Installing agent Python deps …"
 pip install -q -r "$WORKSPACE/agent-requirements.txt"
 
-# ── 5. Flatten dataset using symlinks ─────────────────────────────────────────
-log "Flattening dataset (symlinks) …"
-mkdir -p "$FLAT_DIR"
-python "$REPO_DIR/DeepLearning-tensorFlowLite/flatten_plantnet.py" \
-  --source "$DATA_DIR/images" \
-  --out    "$FLAT_DIR" \
-  --splits train,val,test \
-  --min-images 10
-log "Flatten complete — $(ls "$FLAT_DIR" | wc -l) species classes"
+# ── 5. Flatten dataset using symlinks (idempotent) ───────────────────────────
+if [ ! -d "$FLAT_DIR" ] || [ -z "$(ls -A "$FLAT_DIR" 2>/dev/null)" ]; then
+  log "Flattening dataset (symlinks) …"
+  mkdir -p "$FLAT_DIR"
+  python "$REPO_DIR/DeepLearning-tensorFlowLite/flatten_plantnet.py" \
+    --source "$DATA_DIR/images" \
+    --out    "$FLAT_DIR" \
+    --splits train,val,test \
+    --min-images 10
+  log "Flatten complete — $(ls "$FLAT_DIR" | wc -l) species classes"
+else
+  log "Flatten already done at $FLAT_DIR ($(ls "$FLAT_DIR" | wc -l) classes) — skipping"
+fi
 
 # ── 6. Train (synchronous in this screen session) ─────────────────────────────
 mkdir -p "$RESULTS_DIR"

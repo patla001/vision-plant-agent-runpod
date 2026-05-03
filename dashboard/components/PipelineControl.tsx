@@ -5,6 +5,7 @@ import dynamic from "next/dynamic";
 import PipelineSteps from "./PipelineSteps";
 import LiveLog from "./LiveLog";
 import Diagnostics from "./Diagnostics";
+import OrphanPodModal from "./OrphanPodModal";
 
 const HeroScene   = dynamic(() => import("./HeroScene"),   { ssr: false });
 const TrainingOrb = dynamic(() => import("./TrainingOrb"), { ssr: false });
@@ -111,6 +112,69 @@ export default function PipelineControl({ initialState, onResultsReady }: Props)
     return () => clearInterval(id);
   }, [state.status, refreshPodPoll]);
 
+  // Also poll once when entering the failed state so the UI knows whether
+  // the pod is still alive — that determines whether "Restart same pod"
+  // is offered alongside "Fresh start".
+  useEffect(() => {
+    if (state.status !== "failed") return;
+    if (!state.pod_id) return;   // no pod to check
+    refreshPodPoll();
+  }, [state.status, state.pod_id, refreshPodPoll]);
+
+  const [orphanModalOpen, setOrphanModalOpen] = useState(false);
+
+  const [restarting, setRestarting] = useState(false);
+  const handleRestartTraining = useCallback(async () => {
+    if (!confirm("Restart training on the same pod?\n\nThe screen session will be killed, prior results cleared, and training re-run. The pod stays alive and the dataset is reused.")) {
+      return;
+    }
+    setRestarting(true);
+    try {
+      const r = await fetch("/api/pipeline/restart-training", { method: "POST" });
+      const data = await r.json();
+      if (!r.ok) {
+        alert(`Restart failed: ${data.error ?? "unknown error"}${data.detail ? "\n\n" + data.detail : ""}`);
+        return;
+      }
+      const status: State = await fetch("/api/pipeline/status").then((r) => r.json());
+      setState(status);
+    } catch (e) {
+      alert(`Restart request failed: ${e}`);
+    } finally {
+      setRestarting(false);
+    }
+  }, []);
+
+  const [freshStarting, setFreshStarting] = useState(false);
+  const handleFreshStart = useCallback(async () => {
+    if (!confirm("Fresh start?\n\nThis terminates the current pod (if any), wipes local state, and provisions a new pod. Your color-correction selection is preserved.")) {
+      return;
+    }
+    setFreshStarting(true);
+    try {
+      // Best-effort abort — fine if there's no pod to terminate.
+      try { await fetch("/api/pipeline/abort", { method: "POST" }); } catch { /* ignore */ }
+      await fetch("/api/pipeline/reset",  { method: "POST" });
+      // Re-call start with the current colorCorrect selection
+      const startRes = await fetch("/api/pipeline/start", {
+        method:  "POST",
+        headers: { "Content-Type": "application/json" },
+        body:    JSON.stringify({ color_correct: colorCorrect }),
+      });
+      const startBody = await startRes.json();
+      if (!startRes.ok) {
+        alert(`Start failed: ${startBody.error ?? "unknown error"}`);
+        return;
+      }
+      const status: State = await fetch("/api/pipeline/status").then((r) => r.json());
+      setState(status);
+    } catch (e) {
+      alert(`Fresh start failed: ${e}`);
+    } finally {
+      setFreshStarting(false);
+    }
+  }, [colorCorrect]);
+
   // When poll-pod reports the run is done, sync local results so the rich
   // results dashboard (TrainingCurves, ConfusionMatrix, etc.) works.
   const handleSyncRelease = useCallback(async () => {
@@ -149,11 +213,6 @@ export default function PipelineControl({ initialState, onResultsReady }: Props)
       setStarting(false);
     }
   }, [colorCorrect]);
-
-  const handleRetry = useCallback(async () => {
-    setState({ status: "idle" });
-    await handleStart();
-  }, [handleStart]);
 
   const [aborting, setAborting] = useState(false);
   const handleAbort = useCallback(async () => {
@@ -259,11 +318,38 @@ export default function PipelineControl({ initialState, onResultsReady }: Props)
             </div>
           )}
 
+          {inferred === "unknown" && (
+            <div className="space-y-2 pt-2 border-t border-slate-800">
+              <p className="text-xs text-red-400">
+                Pod is gone and no Release was found. The run did not finish cleanly.
+              </p>
+              <div className="flex gap-2 flex-wrap">
+                <button
+                  onClick={handleFreshStart}
+                  disabled={freshStarting}
+                  className="px-4 py-2 rounded-lg bg-red-500/15 border border-red-500/40 text-red-300 hover:bg-red-500/25 transition text-sm disabled:opacity-50"
+                >
+                  {freshStarting ? "Starting…" : "🔄 Fresh start (new pod)"}
+                </button>
+                <button
+                  onClick={() => setOrphanModalOpen(true)}
+                  className="px-4 py-2 rounded-lg border border-amber-500/30 hover:border-amber-500/50 text-amber-300 transition text-sm"
+                >
+                  🔍 Check for stray pods
+                </button>
+              </div>
+            </div>
+          )}
+
           <p className="text-[11px] text-slate-500 leading-relaxed pt-2 border-t border-slate-800">
             The pod runs autonomously — close this tab, shut down your laptop, or come back hours later.
             Results will be uploaded to a GitHub Release before the pod self-terminates.
           </p>
         </div>
+        <OrphanPodModal
+          open={orphanModalOpen}
+          onClose={() => setOrphanModalOpen(false)}
+        />
       </div>
     );
   }
@@ -306,6 +392,7 @@ export default function PipelineControl({ initialState, onResultsReady }: Props)
           {[
             { label: "RUNPOD_API_KEY set in .env",             color: "text-cyan-400" },
             { label: "ANTHROPIC_API_KEY set in .env",          color: "text-violet-400" },
+            { label: "GITHUB_TOKEN set in .env",               color: "text-fuchsia-400" },
             { label: "SSH public key added to RunPod settings", color: "text-emerald-400" },
           ].map(({ label, color }) => (
             <div key={label} className="flex items-center gap-2.5 text-sm text-slate-400">
@@ -313,6 +400,14 @@ export default function PipelineControl({ initialState, onResultsReady }: Props)
               {label}
             </div>
           ))}
+          <div className="pt-2 border-t border-slate-800 mt-2">
+            <button
+              onClick={() => setOrphanModalOpen(true)}
+              className="text-xs text-amber-400 hover:text-amber-300 transition"
+            >
+              🔍 Check for stray pods on your RunPod account
+            </button>
+          </div>
         </div>
 
         {/* Color correction picker */}
@@ -362,6 +457,10 @@ export default function PipelineControl({ initialState, onResultsReady }: Props)
             )}
           </button>
         </div>
+        <OrphanPodModal
+          open={orphanModalOpen}
+          onClose={() => setOrphanModalOpen(false)}
+        />
       </div>
     );
   }
@@ -520,12 +619,31 @@ export default function PipelineControl({ initialState, onResultsReady }: Props)
           </div>
         </div>
 
-        <div className="flex gap-3">
+        <div className="flex gap-3 flex-wrap">
+          {podPoll?.pod?.alive && (
+            <button
+              onClick={handleRestartTraining}
+              disabled={restarting || freshStarting}
+              className="px-6 py-2.5 bg-gradient-to-r from-cyan-600 to-cyan-700 hover:from-cyan-500 hover:to-cyan-600 rounded-xl text-sm font-semibold transition-all shadow-lg disabled:opacity-50"
+              title="Skip dataset re-download — reuse the alive pod"
+            >
+              {restarting ? "Restarting…" : "↻ Restart training (same pod)"}
+            </button>
+          )}
           <button
-            onClick={handleRetry}
-            className="px-6 py-2.5 bg-gradient-to-r from-red-600 to-red-700 hover:from-red-500 hover:to-red-600 rounded-xl text-sm font-semibold transition-all shadow-lg"
+            onClick={handleFreshStart}
+            disabled={restarting || freshStarting}
+            className="px-6 py-2.5 bg-gradient-to-r from-red-600 to-red-700 hover:from-red-500 hover:to-red-600 rounded-xl text-sm font-semibold transition-all shadow-lg disabled:opacity-50"
+            title="Terminate current pod, wipe state, provision a new pod"
           >
-            🔄 Retry Pipeline
+            {freshStarting ? "Starting…" : "🔄 Fresh start (new pod)"}
+          </button>
+          <button
+            onClick={() => setOrphanModalOpen(true)}
+            className="px-5 py-2.5 glass border border-amber-500/30 hover:border-amber-500/50 rounded-xl text-sm font-medium text-amber-300 transition-all"
+            title="List every pod on your RunPod account"
+          >
+            🔍 Check for stray pods
           </button>
           <button
             onClick={() => navigator.clipboard.writeText(state.error_traceback ?? state.current_step ?? "")}
@@ -534,6 +652,10 @@ export default function PipelineControl({ initialState, onResultsReady }: Props)
             📋 Copy error
           </button>
         </div>
+        <OrphanPodModal
+          open={orphanModalOpen}
+          onClose={() => setOrphanModalOpen(false)}
+        />
       </div>
     );
   }
