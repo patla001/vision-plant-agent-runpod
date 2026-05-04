@@ -14,8 +14,8 @@ dist/
 downloads/
 eggs/
 .eggs/
-lib/
-lib64/
+/lib/
+/lib64/
 parts/
 sdist/
 var/
@@ -272,7 +272,7 @@ Thumbs.db
 *.swp
 *.swo
 *~
-.claude/
+**/.claude/settings.local.json
 .cursor/
 
 # ── Logs ─────────────────────────────────────────────────────
@@ -286,3 +286,4 @@ pnpm-debug.log*
 venv/
 .virtualenv/
 tsbuildinfo*
+*.tsbuildinfo
