@@ -305,8 +305,22 @@ def _train_one(
         loss=tf.keras.losses.CategoricalCrossentropy(from_logits=True),
         metrics=["accuracy"],
     )
+    # Monitor val_loss rather than val_accuracy. With 1081 PlantNet species,
+    # accuracy fluctuates ±0.005 epoch-to-epoch on noise; any small lucky tick
+    # resets the patience counter, so EarlyStopping never fires even when the
+    # model has clearly started overfitting (training loss diving while val
+    # loss climbs). Loss is monotone enough to make patience meaningful here.
+    #
+    # min_delta=1e-3 filters out noise-level "improvements" — without it,
+    # val_loss bouncing 1.6839 → 1.6838 → 1.6840 still resets patience.
+    # 1e-3 is well below the ~0.05 epoch-to-epoch swings we see in practice
+    # but well above floating-point noise.
     early = tf.keras.callbacks.EarlyStopping(
-        monitor="val_accuracy", patience=early_stopping_patience, restore_best_weights=True
+        monitor="val_loss",
+        mode="min",
+        patience=early_stopping_patience,
+        min_delta=1e-3,
+        restore_best_weights=True,
     )
     timing = EpochTimingCallback(max_epochs=epochs, log_prefix=log_prefix)
     cbs: list[tf.keras.callbacks.Callback] = [early, timing]
