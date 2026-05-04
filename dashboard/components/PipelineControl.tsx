@@ -178,6 +178,35 @@ export default function PipelineControl({ initialState, onResultsReady }: Props)
 
   const [orphanModalOpen, setOrphanModalOpen] = useState(false);
 
+  /** Pulls last lines of setup.log + orchestrator.log + screen -ls from the
+   *  pod via /api/pipeline/pod-logs. Used to diagnose a stuck run. */
+  const [podLogs, setPodLogs] = useState<{
+    screenSessions:  string;
+    setupLog:        string;
+    orchestratorLog: string;
+    trainingLogTail: string;
+  } | null>(null);
+  const [fetchingLogs, setFetchingLogs] = useState(false);
+  const [logsError, setLogsError] = useState<string | null>(null);
+
+  const handleFetchLogs = useCallback(async () => {
+    setFetchingLogs(true);
+    setLogsError(null);
+    try {
+      const r = await fetch("/api/pipeline/pod-logs");
+      const body = await r.json();
+      if (!r.ok) {
+        setLogsError(body.error ?? `HTTP ${r.status}`);
+        return;
+      }
+      setPodLogs(body);
+    } catch (e) {
+      setLogsError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setFetchingLogs(false);
+    }
+  }, []);
+
   const [restarting, setRestarting] = useState(false);
   const handleRestartTraining = useCallback(async () => {
     if (!confirm("Restart training on the same pod?\n\nThe screen session will be killed, prior results cleared, and training re-run. The pod stays alive and the dataset is reused.")) {
@@ -353,6 +382,52 @@ export default function PipelineControl({ initialState, onResultsReady }: Props)
               <p className="text-[10px] text-slate-500 mt-1">
                 Then: <code className="font-mono">screen -r cs659</code>
               </p>
+            </div>
+          )}
+
+          {/* Diagnose + recovery actions for the running-on-pod state.
+              Visible whenever the pod is alive — the user might suspect it's
+              stuck (training done but no Release yet, or unexpectedly long
+              uptime) and want to peek at logs or kill it. */}
+          {podAlive && (
+            <div className="space-y-2 pt-2 border-t border-slate-800">
+              <div className="flex gap-2 flex-wrap">
+                <button
+                  onClick={handleFetchLogs}
+                  disabled={fetchingLogs}
+                  className="text-xs px-3 py-1.5 rounded-lg border border-slate-700 hover:border-slate-500 text-slate-300 transition disabled:opacity-50"
+                >
+                  {fetchingLogs ? "Fetching…" : "📋 Fetch pod logs"}
+                </button>
+                <button
+                  onClick={handleAbort}
+                  disabled={aborting}
+                  className="text-xs px-3 py-1.5 rounded-lg border border-red-500/40 bg-red-500/10 text-red-300 hover:bg-red-500/20 transition disabled:opacity-50"
+                >
+                  {aborting ? "Aborting…" : "✕ Abort run (terminate pod)"}
+                </button>
+              </div>
+              {podLogs && (
+                <div className="space-y-2">
+                  <div className="bg-slate-900/60 border border-slate-700 rounded-lg p-3">
+                    <p className="text-[10px] uppercase tracking-widest text-slate-500 mb-1">Screen sessions</p>
+                    <pre className="text-[11px] font-mono text-slate-300 whitespace-pre-wrap break-all">{podLogs.screenSessions || "(empty)"}</pre>
+                  </div>
+                  {podLogs.orchestratorLog && (
+                    <div className="bg-slate-900/60 border border-slate-700 rounded-lg p-3 max-h-72 overflow-y-auto">
+                      <p className="text-[10px] uppercase tracking-widest text-slate-500 mb-1">orchestrator.log (tail)</p>
+                      <pre className="text-[11px] font-mono text-slate-300 whitespace-pre-wrap break-all">{podLogs.orchestratorLog}</pre>
+                    </div>
+                  )}
+                  {podLogs.setupLog && (
+                    <div className="bg-slate-900/60 border border-slate-700 rounded-lg p-3 max-h-72 overflow-y-auto">
+                      <p className="text-[10px] uppercase tracking-widest text-slate-500 mb-1">setup.log (tail)</p>
+                      <pre className="text-[11px] font-mono text-slate-300 whitespace-pre-wrap break-all">{podLogs.setupLog}</pre>
+                    </div>
+                  )}
+                  {logsError && <p className="text-xs text-red-400">{logsError}</p>}
+                </div>
+              )}
             </div>
           )}
 

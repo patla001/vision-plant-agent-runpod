@@ -142,12 +142,40 @@ log "Training finished. Handing off to pod_orchestrator.py …"
 # Run from /workspace/agents so sibling imports (base_agent, analysis_agent,
 # github_release_tool, runpod_api) all resolve via the same sys.path entries
 # the script adds at startup.
+#
+# `|| true` lets a non-zero orchestrator exit fall through to the final
+# safety-net terminate below, so a stuck/crashed orchestrator never leaves
+# the pod billing forever.
 cd "$AGENTS_DIR"
 PYTHONPATH="$AGENTS_DIR:$WORKSPACE" python pod_orchestrator.py \
   --results_dir "$RESULTS_DIR" \
   --done_file   "$DONE_FILE" \
   --run_tag     "$RUN_TAG" \
   --repo_dir    "$REPO_DIR" \
-  2>&1 | tee "$RESULTS_DIR/orchestrator.log"
+  2>&1 | tee "$RESULTS_DIR/orchestrator.log" || true
 
-log "pod_setup.sh complete. Pod should self-terminate momentarily."
+# ── 8. Final safety-net self-terminate ────────────────────────────────────────
+# pod_orchestrator should call self_terminate via Claude tool use, but if the
+# agent loop crashes, hits max_iterations without calling the tool, or raises
+# an unhandled exception, we MUST still terminate this pod or it bills until
+# RunPod's idle limit (or forever). This is idempotent — a second
+# podTerminate on an already-terminated pod is a no-op.
+log "Belt-and-braces self-terminate (in case pod_orchestrator did not)"
+python - <<'PYEOF' || log "Final terminate failed; check RunPod dashboard."
+import os, sys
+sys.path.insert(0, "/workspace")
+sys.path.insert(0, "/workspace/agents")
+try:
+    import runpod_api
+    pod_id = os.environ.get("RUNPOD_POD_ID")
+    if not pod_id:
+        print("RUNPOD_POD_ID env var missing — cannot self-terminate.", file=sys.stderr)
+        sys.exit(2)
+    runpod_api.terminate_pod(pod_id)
+    print(f"Pod {pod_id} terminate request sent.")
+except Exception as exc:
+    print(f"Final terminate raised: {type(exc).__name__}: {exc}", file=sys.stderr)
+    sys.exit(3)
+PYEOF
+
+log "pod_setup.sh complete. Pod should disappear within ~30 seconds."
