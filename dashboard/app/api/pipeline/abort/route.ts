@@ -50,7 +50,10 @@ function killProcess(pid: number): { ok: boolean; error?: string } {
 
 export async function POST() {
   const st = readState();
-  if (st.status !== "running") {
+  // "running" is the laptop-resident-orchestrator state; "running-on-pod" is
+  // the detached pod-side state from PR #20. Both should accept abort —
+  // otherwise the user has no dashboard path to kill a stuck pod-side run.
+  if (st.status !== "running" && st.status !== "running-on-pod") {
     return NextResponse.json({ error: "No running pipeline to abort." }, { status: 409 });
   }
 
