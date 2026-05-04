@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import fs from "fs";
 import path from "path";
+import { writeLastRun } from "../../../../lib/last-run";
 
 const ROOT    = path.resolve(process.cwd(), "..");
 const RESULTS = path.join(ROOT, "results");
@@ -115,6 +116,19 @@ export async function POST() {
     release_url:  release.html_url,
   };
   fs.writeFileSync(STATE, JSON.stringify(updated, null, 2));
+
+  // Durable outcome record — survives /api/pipeline/reset so the home-page
+  // last-run banner can always tell the user this run produced saved results.
+  writeLastRun({
+    run_tag:       runTag,
+    outcome:       "completed_synced",
+    finished_at:   new Date().toISOString(),
+    pod_id:        typeof st.pod_id === "string" ? st.pod_id : undefined,
+    color_correct: typeof st.color_correct === "string" ? st.color_correct : undefined,
+    hp_mode:       typeof st.hp_mode === "string" ? st.hp_mode : undefined,
+    release_url:   release.html_url,
+    asset_count:   downloaded.length,
+  });
 
   return NextResponse.json({
     ok:           true,

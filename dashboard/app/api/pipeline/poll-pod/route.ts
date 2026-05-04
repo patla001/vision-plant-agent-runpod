@@ -15,10 +15,13 @@ const GH_API     = "https://api.github.com";
 //
 //   bootstrapping  — pod_id not yet recorded; bootstrap script still running
 //   training       — pod is up, no Release yet
-//   uploading      — pod is up AND Release exists (orchestrator is uploading)
-//   done           — Release published, pod gone
-//   unknown        — pod gone, no Release found (possibly aborted/failed)
-type InferredStatus = "bootstrapping" | "training" | "uploading" | "done" | "unknown" | "failed";
+//   uploading      — pod is up AND draft Release exists (orchestrator is uploading)
+//   partial        — pod gone, draft Release exists (orchestrator died mid-upload —
+//                     some assets may be salvageable)
+//   done           — published Release, regardless of pod state
+//   unknown        — pod gone, no Release found (run failed before upload — what the
+//                     user calls "pod terminated, no results")
+type InferredStatus = "bootstrapping" | "training" | "uploading" | "partial" | "done" | "unknown" | "failed";
 
 function readState(): Record<string, unknown> {
   try { return JSON.parse(fs.readFileSync(STATE, "utf8")); } catch { return {}; }
@@ -117,8 +120,12 @@ export async function GET() {
   let inferred: InferredStatus = "unknown";
   if (release && !release.draft) {
     inferred = "done";
-  } else if (release && release.draft) {
+  } else if (release && release.draft && podState?.alive) {
     inferred = "uploading";
+  } else if (release && release.draft && !podState?.alive) {
+    // Draft release with a dead pod = orchestrator started uploading then died.
+    // The user can still pull whatever assets were uploaded before the crash.
+    inferred = "partial";
   } else if (podState?.alive) {
     inferred = "training";
   } else if (!podId) {

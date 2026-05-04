@@ -4,6 +4,7 @@ import { useCallback, useEffect, useState } from "react";
 import dynamic from "next/dynamic";
 import PipelineSteps from "./PipelineSteps";
 import LiveLog from "./LiveLog";
+import PodLiveLog from "./PodLiveLog";
 import Diagnostics from "./Diagnostics";
 import OrphanPodModal from "./OrphanPodModal";
 
@@ -42,10 +43,14 @@ interface State {
   run_tag?: string;
   screen_session?: string;
   color_correct?: string;
+  // Choices the user picked on the home page — persisted by the start route
+  // so we can re-hydrate the picker after a failure / pod-terminated event.
+  hp_mode?:         "default" | "ai" | "manual";
+  hyperparameters?: Record<string, number> | null;
 }
 
 interface PollPodResponse {
-  inferredStatus: "idle" | "bootstrapping" | "training" | "uploading" | "done" | "unknown" | "failed";
+  inferredStatus: "idle" | "bootstrapping" | "training" | "uploading" | "partial" | "done" | "unknown" | "failed";
   pod: { alive: boolean; desiredStatus: string | null } | null;
   release: { url: string; draft: boolean } | null;
   runTag?: string;
@@ -76,14 +81,22 @@ export default function PipelineControl({ initialState, onResultsReady }: Props)
   const [state, setState]   = useState<State>(initialState);
   const [starting, setStarting] = useState(false);
   const [startError, setStartError] = useState<string | null>(null);
-  const [colorCorrect, setColorCorrect] = useState<"none" | "gray_world" | "max_rgb">("none");
+  // Initialize the home-page pickers from state so a "rerun with same choices"
+  // works after the page reloads (server state is the only thing that survives
+  // a refresh). "default"/"none" if state has no record.
+  const initialColorCorrect: "none" | "gray_world" | "max_rgb" =
+    (initialState.color_correct === "gray_world" || initialState.color_correct === "max_rgb")
+      ? initialState.color_correct
+      : "none";
+  const [colorCorrect, setColorCorrect] = useState<"none" | "gray_world" | "max_rgb">(initialColorCorrect);
 
   // Hyperparameter source on the home page. "default" uses the JSON in the
   // repo. "ai" pulls the latest AI suggestion from /api/results/...; falls
   // back to "default" silently if no suggestion exists. "manual" exposes
   // editable inputs.
   type HpMode = "default" | "ai" | "manual";
-  const [hpMode, setHpMode] = useState<HpMode>("default");
+  const initialHpMode: HpMode = initialState.hp_mode ?? "default";
+  const [hpMode, setHpMode] = useState<HpMode>(initialHpMode);
   const [aiSuggestion, setAiSuggestion] = useState<{
     diagnosis?:   string;
     reasoning?:   string;
@@ -97,7 +110,19 @@ export default function PipelineControl({ initialState, onResultsReady }: Props)
     learning_rate:            string;
     dropout:                  string;
     early_stopping_patience:  string;
-  }>({ epochs: "", learning_rate: "", dropout: "", early_stopping_patience: "" });
+  }>(() => {
+    // Re-hydrate from state.hyperparameters when the previous run was started
+    // in manual mode. Keeps the user's inputs visible after a page reload so
+    // "rerun with same choices" actually works.
+    const hp = initialState.hyperparameters ?? {};
+    const s = (k: keyof typeof hp): string => hp?.[k] !== undefined ? String(hp[k]) : "";
+    return {
+      epochs:                   s("epochs"),
+      learning_rate:            s("learning_rate"),
+      dropout:                  s("dropout"),
+      early_stopping_patience:  s("early_stopping_patience"),
+    };
+  });
 
   // Lazy-load the AI suggestion when the user picks that mode for the first time.
   useEffect(() => {
@@ -178,35 +203,6 @@ export default function PipelineControl({ initialState, onResultsReady }: Props)
 
   const [orphanModalOpen, setOrphanModalOpen] = useState(false);
 
-  /** Pulls last lines of setup.log + orchestrator.log + screen -ls from the
-   *  pod via /api/pipeline/pod-logs. Used to diagnose a stuck run. */
-  const [podLogs, setPodLogs] = useState<{
-    screenSessions:  string;
-    setupLog:        string;
-    orchestratorLog: string;
-    trainingLogTail: string;
-  } | null>(null);
-  const [fetchingLogs, setFetchingLogs] = useState(false);
-  const [logsError, setLogsError] = useState<string | null>(null);
-
-  const handleFetchLogs = useCallback(async () => {
-    setFetchingLogs(true);
-    setLogsError(null);
-    try {
-      const r = await fetch("/api/pipeline/pod-logs");
-      const body = await r.json();
-      if (!r.ok) {
-        setLogsError(body.error ?? `HTTP ${r.status}`);
-        return;
-      }
-      setPodLogs(body);
-    } catch (e) {
-      setLogsError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setFetchingLogs(false);
-    }
-  }, []);
-
   const [restarting, setRestarting] = useState(false);
   const handleRestartTraining = useCallback(async () => {
     if (!confirm("Restart training on the same pod?\n\nThe screen session will be killed, prior results cleared, and training re-run. The pod stays alive and the dataset is reused.")) {
@@ -246,6 +242,7 @@ export default function PipelineControl({ initialState, onResultsReady }: Props)
         body:    JSON.stringify({
           color_correct:   colorCorrect,
           hyperparameters: buildHyperparameters(),
+          hp_mode:         hpMode,
         }),
       });
       const startBody = await startRes.json();
@@ -260,7 +257,81 @@ export default function PipelineControl({ initialState, onResultsReady }: Props)
     } finally {
       setFreshStarting(false);
     }
-  }, [colorCorrect, buildHyperparameters]);
+  }, [colorCorrect, buildHyperparameters, hpMode]);
+
+  // Durable record of the most recent run's outcome. Survives /api/pipeline/reset
+  // and tells the user, on the idle home page, whether their last run actually
+  // produced saved results — closing the gap where pipeline_state.json gets
+  // overwritten on every new start, leaving no trace of the prior outcome.
+  interface LastRun {
+    run_tag:        string;
+    outcome:        "completed_synced" | "completed_unsynced" | "partial_upload"
+                   | "terminated_no_results" | "aborted_by_user" | "failed_pre_pod";
+    finished_at:    string;
+    pod_id?:        string;
+    color_correct?: string;
+    hp_mode?:       string;
+    release_url?:   string;
+    asset_count?:   number;
+    message?:       string;
+  }
+  const [lastRun, setLastRun] = useState<LastRun | null>(null);
+  const refreshLastRun = useCallback(async () => {
+    try {
+      const r = await fetch("/api/pipeline/last-run");
+      if (r.ok) setLastRun(await r.json());
+    } catch { /* ignore — non-fatal */ }
+  }, []);
+  // Pull the last-run record once on mount; also refresh whenever we
+  // transition out of an active state into idle so the card stays current.
+  useEffect(() => { void refreshLastRun(); }, [refreshLastRun]);
+  useEffect(() => {
+    if (state.status === "idle") void refreshLastRun();
+  }, [state.status, refreshLastRun]);
+
+  // Wipes pipeline_state.json + pipeline.log so the dashboard returns to its
+  // idle home page. Used by the "Return to home" button on the pod-terminated
+  // banner — when a pod ended without producing a Release, the user wants to
+  // get back to a clean slate without spawning a new pod.
+  //
+  // Before resetting, we POST to /api/pipeline/finalize so the durable
+  // last_run.json record captures the outcome (terminated_no_results /
+  // partial_upload). That file is what feeds the idle-home "Previous run"
+  // card, and reset doesn't touch it — so the user always gets to see
+  // whether their last run produced saved results.
+  const [resetting, setResetting] = useState(false);
+  const handleResetToHome = useCallback(async (
+    finalizeOutcome?: "terminated_no_results" | "partial_upload" | "completed_unsynced",
+  ) => {
+    setResetting(true);
+    try {
+      if (finalizeOutcome) {
+        try {
+          await fetch("/api/pipeline/finalize", {
+            method:  "POST",
+            headers: { "Content-Type": "application/json" },
+            body:    JSON.stringify({ outcome: finalizeOutcome }),
+          });
+        } catch { /* non-fatal */ }
+      }
+      // Best-effort abort first so any orphan local Python process / lingering
+      // pod is terminated. Server treats both as no-ops if nothing's running.
+      try { await fetch("/api/pipeline/abort", { method: "POST" }); } catch { /* ignore */ }
+      await fetch("/api/pipeline/reset", { method: "POST" });
+      // Force the UI into idle without a full page reload — preserves the
+      // hydrated colorCorrect / hpMode / manualHp pickers so the user can
+      // tweak settings and click Start without re-entering them.
+      setState({ status: "idle" });
+      setPodPoll(null);
+      // Refresh the last-run card so the idle home page picks up the
+      // outcome we just recorded.
+      void refreshLastRun();
+    } catch (e) {
+      alert(`Reset failed: ${e}`);
+    } finally {
+      setResetting(false);
+    }
+  }, [refreshLastRun]);
 
   // When poll-pod reports the run is done, sync local results so the rich
   // results dashboard (TrainingCurves, ConfusionMatrix, etc.) works.
@@ -292,6 +363,7 @@ export default function PipelineControl({ initialState, onResultsReady }: Props)
         body:    JSON.stringify({
           color_correct:   colorCorrect,
           hyperparameters: hp,
+          hp_mode:         hpMode,
         }),
       });
       const data = await res.json();
@@ -303,7 +375,7 @@ export default function PipelineControl({ initialState, onResultsReady }: Props)
     } finally {
       setStarting(false);
     }
-  }, [colorCorrect, buildHyperparameters]);
+  }, [colorCorrect, buildHyperparameters, hpMode]);
 
   const [aborting, setAborting] = useState(false);
   const handleAbort = useCallback(async () => {
@@ -339,11 +411,18 @@ export default function PipelineControl({ initialState, onResultsReady }: Props)
       bootstrapping: { text: "Bootstrapping (provision in progress)", color: "text-violet-300" },
       training:      { text: "Training on pod",                       color: "text-cyan-300"   },
       uploading:     { text: "Uploading results to GitHub",           color: "text-amber-300"  },
+      partial:       { text: "Pod terminated — partial upload",       color: "text-red-300"    },
       done:          { text: "Done — pod terminated",                 color: "text-emerald-300"},
-      unknown:       { text: "Unknown — pod gone, no Release",        color: "text-red-300"    },
+      unknown:       { text: "Pod terminated — no results uploaded",  color: "text-red-300"    },
       failed:        { text: "Failed",                                  color: "text-red-300"    },
     };
     const sl = statusLabel[inferred] ?? { text: inferred, color: "text-slate-300" };
+
+    // Show a prominent pod-terminated banner whenever poll-pod confirms the
+    // pod is gone with no usable Release (or a partial one). Without this,
+    // the dashboard stays stuck on "Run on pod (detached)" forever even
+    // though there's nothing happening on RunPod's side.
+    const podTerminated = podAlive === false && (inferred === "unknown" || inferred === "partial");
 
     return (
       <div className="animate-float-up flex flex-col items-center gap-6 min-h-[60vh] px-4">
@@ -361,6 +440,104 @@ export default function PipelineControl({ initialState, onResultsReady }: Props)
               {pollRefreshing ? "Refreshing…" : "↻ Refresh status"}
             </button>
           </div>
+
+          {podTerminated && (
+            <div className="bg-red-500/10 border border-red-500/40 rounded-xl p-4 space-y-3">
+              <div className="flex items-start gap-3">
+                <span className="text-2xl">⛔</span>
+                <div className="flex-1 min-w-0">
+                  <p className="font-bold text-red-300 text-sm">
+                    Pod has been terminated
+                  </p>
+                  <p className="text-xs text-red-300/80 mt-1 leading-relaxed">
+                    {inferred === "partial"
+                      ? "The orchestrator started uploading results but the pod died before finishing. Some assets may still be downloadable from the draft GitHub Release."
+                      : "Training did not finish and no GitHub Release was created — there are no results to download."}
+                  </p>
+                </div>
+              </div>
+
+              {/* Choices we'll re-use if the user clicks "Run again". The pickers below
+                  are pre-filled from these so the user can also tweak before re-running. */}
+              <div className="text-[11px] text-slate-400 grid grid-cols-2 gap-x-3 gap-y-0.5 bg-slate-900/40 rounded-lg p-2">
+                <span className="text-slate-500">Last color correction</span>
+                <span className="font-mono">{state.color_correct ?? "default"}</span>
+                <span className="text-slate-500">Last hyperparameter mode</span>
+                <span className="font-mono">{state.hp_mode ?? "default"}</span>
+              </div>
+
+              {/* Hyperparameter picker so the user can choose default / AI-suggested
+                  / manual before clicking Run again — fulfills the "this time the user
+                  can manually or the AI give the hyperparameters" request. */}
+              <div className="space-y-2">
+                <p className="text-[10px] uppercase tracking-widest text-slate-500">Hyperparameters for next run</p>
+                <div className="grid grid-cols-3 gap-2 text-xs">
+                  {(["default", "ai", "manual"] as const).map((m) => (
+                    <button
+                      key={m}
+                      onClick={() => setHpMode(m)}
+                      className={`px-2 py-1.5 rounded-lg border transition ${
+                        hpMode === m
+                          ? "border-cyan-400 bg-cyan-500/10 text-cyan-300"
+                          : "border-slate-700 text-slate-400 hover:border-slate-500"
+                      }`}
+                    >
+                      {m === "default" ? "Default" : m === "ai" ? "AI suggested" : "Manual"}
+                    </button>
+                  ))}
+                </div>
+                {hpMode === "ai" && aiSuggestion?.error && (
+                  <p className="text-[11px] text-amber-400">{aiSuggestion.error}</p>
+                )}
+              </div>
+
+              <div className="flex flex-wrap gap-2 pt-1">
+                <button
+                  onClick={handleFreshStart}
+                  disabled={freshStarting || resetting}
+                  className="px-4 py-2 rounded-lg bg-cyan-500/15 border border-cyan-500/40 text-cyan-300 hover:bg-cyan-500/25 transition text-xs font-semibold disabled:opacity-50"
+                >
+                  {freshStarting ? "Starting…" : "↻ Run again with same color correction"}
+                </button>
+                <button
+                  onClick={() => handleResetToHome(
+                    inferred === "partial" ? "partial_upload" : "terminated_no_results",
+                  )}
+                  disabled={resetting || freshStarting}
+                  className="px-4 py-2 rounded-lg border border-slate-600 hover:border-slate-400 text-slate-300 transition text-xs font-semibold disabled:opacity-50"
+                >
+                  {resetting ? "Resetting…" : "🏠 Return to home"}
+                </button>
+                <button
+                  onClick={() => setOrphanModalOpen(true)}
+                  className="px-4 py-2 rounded-lg border border-amber-500/30 hover:border-amber-500/50 text-amber-300 transition text-xs"
+                >
+                  🔍 Check for stray pods
+                </button>
+              </div>
+
+              {inferred === "partial" && releaseUrl && (
+                <div className="pt-2 border-t border-red-500/20 space-y-2">
+                  <a
+                    href={releaseUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="inline-flex items-center gap-2 text-xs text-cyan-300 hover:text-cyan-200"
+                  >
+                    ⧉ View partial Release on GitHub
+                  </a>
+                  <button
+                    onClick={handleSyncRelease}
+                    disabled={syncing}
+                    className="w-full px-3 py-2 rounded-lg bg-amber-500/10 border border-amber-500/40 text-amber-300 hover:bg-amber-500/20 transition text-xs disabled:opacity-50"
+                  >
+                    {syncing ? "Downloading…" : "⬇ Try to sync partial assets"}
+                  </button>
+                  {syncError && <p className="text-xs text-red-400">{syncError}</p>}
+                </div>
+              )}
+            </div>
+          )}
 
           <div className="grid grid-cols-2 gap-2 text-sm">
             <div className="text-slate-500">Pod ID</div>
@@ -385,47 +562,24 @@ export default function PipelineControl({ initialState, onResultsReady }: Props)
             </div>
           )}
 
-          {/* Diagnose + recovery actions for the running-on-pod state.
-              Visible whenever the pod is alive — the user might suspect it's
-              stuck (training done but no Release yet, or unexpectedly long
-              uptime) and want to peek at logs or kill it. */}
-          {podAlive && (
-            <div className="space-y-2 pt-2 border-t border-slate-800">
-              <div className="flex gap-2 flex-wrap">
-                <button
-                  onClick={handleFetchLogs}
-                  disabled={fetchingLogs}
-                  className="text-xs px-3 py-1.5 rounded-lg border border-slate-700 hover:border-slate-500 text-slate-300 transition disabled:opacity-50"
-                >
-                  {fetchingLogs ? "Fetching…" : "📋 Fetch pod logs"}
-                </button>
-                <button
-                  onClick={handleAbort}
-                  disabled={aborting}
-                  className="text-xs px-3 py-1.5 rounded-lg border border-red-500/40 bg-red-500/10 text-red-300 hover:bg-red-500/20 transition disabled:opacity-50"
-                >
-                  {aborting ? "Aborting…" : "✕ Abort run (terminate pod)"}
-                </button>
-              </div>
-              {podLogs && (
-                <div className="space-y-2">
-                  <div className="bg-slate-900/60 border border-slate-700 rounded-lg p-3">
-                    <p className="text-[10px] uppercase tracking-widest text-slate-500 mb-1">Screen sessions</p>
-                    <pre className="text-[11px] font-mono text-slate-300 whitespace-pre-wrap break-all">{podLogs.screenSessions || "(empty)"}</pre>
-                  </div>
-                  {podLogs.orchestratorLog && (
-                    <div className="bg-slate-900/60 border border-slate-700 rounded-lg p-3 max-h-72 overflow-y-auto">
-                      <p className="text-[10px] uppercase tracking-widest text-slate-500 mb-1">orchestrator.log (tail)</p>
-                      <pre className="text-[11px] font-mono text-slate-300 whitespace-pre-wrap break-all">{podLogs.orchestratorLog}</pre>
-                    </div>
-                  )}
-                  {podLogs.setupLog && (
-                    <div className="bg-slate-900/60 border border-slate-700 rounded-lg p-3 max-h-72 overflow-y-auto">
-                      <p className="text-[10px] uppercase tracking-widest text-slate-500 mb-1">setup.log (tail)</p>
-                      <pre className="text-[11px] font-mono text-slate-300 whitespace-pre-wrap break-all">{podLogs.setupLog}</pre>
-                    </div>
-                  )}
-                  {logsError && <p className="text-xs text-red-400">{logsError}</p>}
+          {/* Always-visible live tail of the pod's screen logs. Polls
+              /api/pipeline/pod-logs every 10 s while the pod is alive,
+              freezes (with last frame still visible) once the pod ends.
+              Mirrors the experience of the legacy "running" view, which
+              auto-streamed pipeline.log — the user no longer has to click
+              "Fetch pod logs" to peek at progress. */}
+          {state.pod_ip && state.pod_port && (
+            <div className="pt-2 border-t border-slate-800 space-y-2">
+              <PodLiveLog enabled={podAlive === true} />
+              {podAlive && (
+                <div className="flex justify-end">
+                  <button
+                    onClick={handleAbort}
+                    disabled={aborting}
+                    className="text-xs px-3 py-1.5 rounded-lg border border-red-500/40 bg-red-500/10 text-red-300 hover:bg-red-500/20 transition disabled:opacity-50"
+                  >
+                    {aborting ? "Aborting…" : "✕ Abort run (terminate pod)"}
+                  </button>
                 </div>
               )}
             </div>
@@ -455,33 +609,12 @@ export default function PipelineControl({ initialState, onResultsReady }: Props)
             </div>
           )}
 
-          {inferred === "unknown" && (
-            <div className="space-y-2 pt-2 border-t border-slate-800">
-              <p className="text-xs text-red-400">
-                Pod is gone and no Release was found. The run did not finish cleanly.
-              </p>
-              <div className="flex gap-2 flex-wrap">
-                <button
-                  onClick={handleFreshStart}
-                  disabled={freshStarting}
-                  className="px-4 py-2 rounded-lg bg-red-500/15 border border-red-500/40 text-red-300 hover:bg-red-500/25 transition text-sm disabled:opacity-50"
-                >
-                  {freshStarting ? "Starting…" : "🔄 Fresh start (new pod)"}
-                </button>
-                <button
-                  onClick={() => setOrphanModalOpen(true)}
-                  className="px-4 py-2 rounded-lg border border-amber-500/30 hover:border-amber-500/50 text-amber-300 transition text-sm"
-                >
-                  🔍 Check for stray pods
-                </button>
-              </div>
-            </div>
+          {!podTerminated && (
+            <p className="text-[11px] text-slate-500 leading-relaxed pt-2 border-t border-slate-800">
+              The pod runs autonomously — close this tab, shut down your laptop, or come back hours later.
+              Results will be uploaded to a GitHub Release before the pod self-terminates.
+            </p>
           )}
-
-          <p className="text-[11px] text-slate-500 leading-relaxed pt-2 border-t border-slate-800">
-            The pod runs autonomously — close this tab, shut down your laptop, or come back hours later.
-            Results will be uploaded to a GitHub Release before the pod self-terminates.
-          </p>
         </div>
         <OrphanPodModal
           open={orphanModalOpen}
@@ -493,10 +626,75 @@ export default function PipelineControl({ initialState, onResultsReady }: Props)
 
   /* ── IDLE ──────────────────────────────────────────────────── */
   if (state.status === "idle") {
+    // Outcome label / styling for the persistent last-run card. Cases the
+    // user actually wants to distinguish at a glance: did the run produce
+    // saved results, or did the pod die without uploading anything?
+    const lastRunMeta: Record<LastRun["outcome"], { icon: string; title: string; tone: string; border: string }> = {
+      completed_synced:      { icon: "✅", title: "Completed — results saved",            tone: "text-emerald-300", border: "border-emerald-500/40" },
+      completed_unsynced:    { icon: "📦", title: "Completed — Release ready to sync",     tone: "text-cyan-300",    border: "border-cyan-500/40"    },
+      partial_upload:        { icon: "⚠️", title: "Partial upload — pod died mid-upload",  tone: "text-amber-300",   border: "border-amber-500/40"   },
+      terminated_no_results: { icon: "❌", title: "Pod terminated — no results saved",     tone: "text-red-300",     border: "border-red-500/40"     },
+      aborted_by_user:       { icon: "🛑", title: "Aborted by you — no results saved",     tone: "text-red-300",     border: "border-red-500/40"     },
+      failed_pre_pod:        { icon: "💥", title: "Failed before pod started",              tone: "text-red-300",     border: "border-red-500/40"     },
+    };
+    const lr  = lastRun;
+    const lrm = lr ? lastRunMeta[lr.outcome] : null;
+
     return (
       <div className="animate-float-up relative flex flex-col items-center justify-center min-h-[72vh] gap-10 text-center px-4 overflow-hidden">
         {/* Three.js particle neural network — full page background */}
         <HeroScene className="pointer-events-none opacity-60" />
+
+        {/* Previous-run summary card. Tells the user, at a glance, whether the
+            last run actually saved results — the gap that motivated the
+            run-outcome-tracking skill. Survives /api/pipeline/reset because
+            it reads from results/last_run.json, not pipeline_state.json. */}
+        {lr && lrm && (
+          <div className={`glass rounded-2xl px-5 py-4 w-full max-w-md text-left border ${lrm.border} space-y-3`}>
+            <div className="flex items-start gap-3">
+              <span className="text-2xl mt-0.5">{lrm.icon}</span>
+              <div className="flex-1 min-w-0">
+                <p className={`text-sm font-bold ${lrm.tone}`}>{lrm.title}</p>
+                <p className="text-[11px] text-slate-500 font-mono break-all">{lr.run_tag}</p>
+                <p className="text-[10px] text-slate-600 mt-0.5">
+                  {new Date(lr.finished_at).toLocaleString()}
+                  {lr.color_correct && lr.color_correct !== "default" && <> · cc: <span className="font-mono">{lr.color_correct}</span></>}
+                  {lr.hp_mode && lr.hp_mode !== "default" && <> · hp: <span className="font-mono">{lr.hp_mode}</span></>}
+                </p>
+                {lr.message && <p className="text-[11px] text-slate-400 mt-1">{lr.message}</p>}
+              </div>
+            </div>
+            <div className="flex flex-wrap gap-2">
+              {lr.outcome === "completed_synced" && (
+                <a
+                  href="/api/results/tflite"
+                  className="text-xs px-3 py-1.5 rounded-lg border border-emerald-500/40 bg-emerald-500/10 text-emerald-300 hover:bg-emerald-500/20 transition"
+                >
+                  ⬇ Download .tflite
+                </a>
+              )}
+              {(lr.outcome === "completed_unsynced" || lr.outcome === "partial_upload") && (
+                <button
+                  onClick={handleSyncRelease}
+                  disabled={syncing}
+                  className="text-xs px-3 py-1.5 rounded-lg border border-cyan-500/40 bg-cyan-500/10 text-cyan-300 hover:bg-cyan-500/20 transition disabled:opacity-50"
+                >
+                  {syncing ? "Syncing…" : "⬇ Sync release & open dashboard"}
+                </button>
+              )}
+              {lr.release_url && (
+                <a
+                  href={lr.release_url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-xs px-3 py-1.5 rounded-lg border border-slate-600 hover:border-slate-400 text-slate-300 transition"
+                >
+                  ⧉ View on GitHub
+                </a>
+              )}
+            </div>
+          </div>
+        )}
 
         {/* Hero */}
         <div className="space-y-4">
