@@ -12,16 +12,25 @@ function readState(): Record<string, unknown> {
 }
 
 function tailFile(podIp: string, podPort: number, remotePath: string, lines = 80): { ok: boolean; content: string } {
-  // tail -n preserves exact bytes; we'll let the client truncate further.
-  // Use `cat <path> 2>/dev/null || echo` so a missing file returns the marker
-  // instead of failing the whole call.
+  // Two non-obvious bits in this remote command:
+  //   1. `[ -f path ]` precedes the pipe so a missing file always prints the
+  //      fallback. Relying on `tail | tr || echo` doesn't work because tr
+  //      exits 0 on empty stdin even when tail's input redirection fails.
+  //   2. `tr '\r' '\n'` expands Keras / wget progress bars (which overwrite
+  //      a single line via carriage returns) into bounded discrete lines so
+  //      `tail -n` can actually limit the response size.
+  const remoteCmd =
+    `[ -f ${remotePath} ] && ` +
+    `tr '\\r' '\\n' < ${remotePath} | tail -n ${lines} ` +
+    `|| echo '[file not found: ${remotePath}]'`;
+
   const r = spawnSync("ssh", [
     "-T", "-n",
     "-p", String(podPort),
     "-o", "StrictHostKeyChecking=no",
     "-o", "ConnectTimeout=20",
     `root@${podIp}`,
-    `tail -n ${lines} ${remotePath} 2>/dev/null || echo '[file not found: ${remotePath}]'`,
+    remoteCmd,
   ], { encoding: "utf8", timeout: 30_000 });
   if (r.status !== 0) {
     return { ok: false, content: ((r.stdout || "") + (r.stderr || "")).slice(-4000) };
