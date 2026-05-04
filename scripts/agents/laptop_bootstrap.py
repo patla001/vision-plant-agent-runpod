@@ -189,12 +189,20 @@ def main() -> None:
 
         # Launch the orchestrator screen session. We stash the env vars
         # via .bashrc-style export so the screen child inherits them.
+        # `-L -Logfile /workspace/setup.log` tells screen to mirror the
+        # entire pty output (everything you'd see in `screen -r cs659`)
+        # to a file. Without this, the redirect on the screen command
+        # itself only catches screen's startup errors — the bash inside
+        # the pty writes to screen's internal buffer, which the dashboard
+        # cannot read.
         cmd = (
             "set -e && "
             "chmod +x /workspace/pod_setup.sh && "
+            "rm -f /workspace/setup.log && "
             f"( setsid env {cc_export}{run_tag_export}"
-            "    screen -dmS cs659 bash /workspace/pod_setup.sh "
-            "    > /workspace/setup.log 2>&1 < /dev/null ) && "
+            "    screen -dmS cs659 -L -Logfile /workspace/setup.log "
+            "    bash /workspace/pod_setup.sh "
+            "    > /dev/null 2>&1 < /dev/null ) && "
             "sleep 2 && "
             "screen -ls | grep cs659 || (echo SCREEN_NOT_RUNNING; exit 1)"
         )

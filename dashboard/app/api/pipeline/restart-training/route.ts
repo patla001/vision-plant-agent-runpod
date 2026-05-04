@@ -66,21 +66,26 @@ export async function POST() {
 
   // Single SSH command:
   //   1. kill stale screen
-  //   2. clear DONE + prior results
+  //   2. clear DONE + prior results + setup.log
   //   3. start fresh screen running pod_setup.sh with new RUN_TAG
   //
   // pod_setup.sh is idempotent (added in this PR) so wget/unzip/flatten
-  // skip when their outputs already exist on disk.
+  // skip when their outputs already exist on disk. `-L -Logfile` tells
+  // screen to mirror its pty output to setup.log so the dashboard's
+  // pod-logs route can tail live progress (the outer redirect only
+  // catches screen's startup errors).
   const ccExport = colorCorrect ? `COLOR_CORRECT=${colorCorrect} ` : "";
   const remoteCmd = [
     "set -e",
     "screen -S cs659 -X quit 2>/dev/null || true",
     "rm -f /workspace/DONE",
     "rm -rf /workspace/results/* 2>/dev/null || true",
+    "rm -f /workspace/setup.log",
     "chmod +x /workspace/pod_setup.sh",
     `( setsid env RUN_TAG=${newRunTag} ${ccExport}` +
-      "  screen -dmS cs659 bash /workspace/pod_setup.sh " +
-      "  > /workspace/setup.log 2>&1 < /dev/null )",
+      "  screen -dmS cs659 -L -Logfile /workspace/setup.log " +
+      "  bash /workspace/pod_setup.sh " +
+      "  > /dev/null 2>&1 < /dev/null )",
     "sleep 2",
     "screen -ls | grep cs659 || (echo SCREEN_NOT_RUNNING; exit 1)",
   ].join(" && ");
