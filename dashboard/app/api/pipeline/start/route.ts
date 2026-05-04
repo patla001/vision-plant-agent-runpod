@@ -61,11 +61,15 @@ function sanitizeHyperparameters(raw: unknown): Record<string, number> | null {
 export async function POST(req: NextRequest) {
   // Optional body: {
   //   color_correct?: "none" | "gray_world" | "max_rgb",
-  //   hyperparameters?: { epochs?, learning_rate?, dropout?, early_stopping_patience? }
+  //   hyperparameters?: { epochs?, learning_rate?, dropout?, early_stopping_patience? },
+  //   hp_mode?: "default" | "ai" | "manual"   // tracked only so the UI can re-hydrate
+  //                                            // the picker after a rerun — does not
+  //                                            // affect what's sent to the pod.
   // }
   // Anything else falls back to model_hyperparameters.json's defaults.
   let colorCorrect:    ColorCorrect | null = null;
   let hyperparameters: Record<string, number> | null = null;
+  let hpMode: "default" | "ai" | "manual" | null = null;
   try {
     const body = await req.json().catch(() => ({}));
     const raw = typeof body?.color_correct === "string" ? body.color_correct : "";
@@ -78,6 +82,8 @@ export async function POST(req: NextRequest) {
       colorCorrect = raw as ColorCorrect;
     }
     hyperparameters = sanitizeHyperparameters(body?.hyperparameters);
+    const m = body?.hp_mode;
+    if (m === "default" || m === "ai" || m === "manual") hpMode = m;
   } catch { /* no body — fine */ }
 
   // Verify Python is callable before doing anything else
@@ -127,7 +133,11 @@ export async function POST(req: NextRequest) {
   child.unref();
   fs.closeSync(logFd);
 
-  // Write initial state (Python will overwrite with pid from its own process)
+  // Write initial state (Python will overwrite with pid from its own process).
+  // We persist the hyperparameter selection (mode + override values) so the
+  // dashboard can re-hydrate the home-page picker if the user comes back
+  // after a failure or pod termination and wants to re-run with the same
+  // (or different) choices without re-typing them.
   const initial = {
     status: "running",
     current_step: "Starting pipeline...",
@@ -137,6 +147,8 @@ export async function POST(req: NextRequest) {
     pid: child.pid,
     python_bin: pythonBin,
     color_correct: colorCorrect ?? "default",
+    hp_mode: hpMode ?? "default",
+    hyperparameters: hyperparameters ?? null,
   };
   fs.writeFileSync(STATE, JSON.stringify(initial, null, 2));
 

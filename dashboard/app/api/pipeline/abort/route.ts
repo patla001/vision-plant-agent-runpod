@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import fs from "fs";
 import path from "path";
+import { writeLastRun } from "../../../../lib/last-run";
 
 const ROOT    = path.resolve(process.cwd(), "..");
 const RESULTS = path.join(ROOT, "results");
@@ -94,6 +95,22 @@ export async function POST() {
     abort_proc_result: procResult,
   };
   fs.writeFileSync(STATE, JSON.stringify(aborted, null, 2));
+
+  // Step 4: durable outcome record. Tells the home-page last-run banner the
+  // user explicitly killed the run — distinct from "pod died on its own".
+  // Skipped when there's no run_tag yet (abort happened before bootstrap
+  // even recorded one) — nothing meaningful to label.
+  if (typeof st.run_tag === "string" && st.run_tag) {
+    writeLastRun({
+      run_tag:       st.run_tag,
+      outcome:       "aborted_by_user",
+      finished_at:   new Date().toISOString(),
+      pod_id:        typeof st.pod_id === "string" ? st.pod_id : undefined,
+      color_correct: typeof st.color_correct === "string" ? st.color_correct : undefined,
+      hp_mode:       typeof st.hp_mode === "string" ? st.hp_mode : undefined,
+      message:       "User clicked Abort. Pod terminated to stop billing.",
+    });
+  }
 
   return NextResponse.json({
     aborted: true,
