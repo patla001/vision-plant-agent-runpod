@@ -28,6 +28,37 @@ AGENTS_DIR="$WORKSPACE/agents"
 
 log() { echo "[$(date -u '+%Y-%m-%d %H:%M:%S UTC')] $*"; }
 
+# ── Safety-net self-terminate ────────────────────────────────────────────────
+# Registered as an EXIT trap below so it fires on every exit path:
+#   - normal completion (orchestrator self_terminate already ran; this is a no-op)
+#   - `set -e` abort (e.g. apt-get / pip / training crashes mid-stream)
+#   - pipefail-induced exit
+# Without the trap, any failure before the orchestrator block would orphan the
+# pod (script aborts before reaching the bottom-of-file terminate block) — a
+# real-world bug we hit on the run that produced the 7h-stuck pod.
+self_terminate_safety_net() {
+  local rc=$?
+  log "EXIT trap fired (script exit code $rc) — ensuring pod terminates."
+  python - <<'PYEOF' || log "Final terminate failed; check RunPod dashboard."
+import os, sys
+sys.path.insert(0, "/workspace")
+sys.path.insert(0, "/workspace/agents")
+try:
+    import runpod_api
+    pod_id = os.environ.get("RUNPOD_POD_ID")
+    if not pod_id:
+        print("RUNPOD_POD_ID env var missing — cannot self-terminate.", file=sys.stderr)
+        sys.exit(2)
+    runpod_api.terminate_pod(pod_id)
+    print(f"Pod {pod_id} terminate request sent.")
+except Exception as exc:
+    print(f"Final terminate raised: {type(exc).__name__}: {exc}", file=sys.stderr)
+    sys.exit(3)
+PYEOF
+  return $rc
+}
+trap self_terminate_safety_net EXIT
+
 # Source .env so subsequent processes inherit ANTHROPIC_API_KEY, GITHUB_TOKEN, etc.
 if [ -f "$WORKSPACE/.env" ]; then
   set -a
@@ -154,28 +185,5 @@ PYTHONPATH="$AGENTS_DIR:$WORKSPACE" python pod_orchestrator.py \
   --repo_dir    "$REPO_DIR" \
   2>&1 | tee "$RESULTS_DIR/orchestrator.log" || true
 
-# ── 8. Final safety-net self-terminate ────────────────────────────────────────
-# pod_orchestrator should call self_terminate via Claude tool use, but if the
-# agent loop crashes, hits max_iterations without calling the tool, or raises
-# an unhandled exception, we MUST still terminate this pod or it bills until
-# RunPod's idle limit (or forever). This is idempotent — a second
-# podTerminate on an already-terminated pod is a no-op.
-log "Belt-and-braces self-terminate (in case pod_orchestrator did not)"
-python - <<'PYEOF' || log "Final terminate failed; check RunPod dashboard."
-import os, sys
-sys.path.insert(0, "/workspace")
-sys.path.insert(0, "/workspace/agents")
-try:
-    import runpod_api
-    pod_id = os.environ.get("RUNPOD_POD_ID")
-    if not pod_id:
-        print("RUNPOD_POD_ID env var missing — cannot self-terminate.", file=sys.stderr)
-        sys.exit(2)
-    runpod_api.terminate_pod(pod_id)
-    print(f"Pod {pod_id} terminate request sent.")
-except Exception as exc:
-    print(f"Final terminate raised: {type(exc).__name__}: {exc}", file=sys.stderr)
-    sys.exit(3)
-PYEOF
-
-log "pod_setup.sh complete. Pod should disappear within ~30 seconds."
+log "pod_setup.sh complete. The EXIT trap will issue the final terminate. "
+log "Pod should disappear within ~30 seconds."
