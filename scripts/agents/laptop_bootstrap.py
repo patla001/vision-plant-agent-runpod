@@ -24,6 +24,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -50,38 +51,109 @@ import runpod_api
 VALID_COLOR_CORRECT = ("none", "gray_world", "max_rgb")
 
 
-def _scp(ip: str, port: int, local: Path, remote: str) -> None:
-    subprocess.run(
-        ["scp", "-q", "-P", str(port),
-         "-o", "StrictHostKeyChecking=no",
-         "-o", "ConnectTimeout=20",
-         str(local), f"root@{ip}:{remote}"],
-        check=True, timeout=120,
-    )
+# RunPod's pod accepts a TCP connection on port 22 well before sshd has
+# fully accepted/streamed: early SCP/SSH commands routinely die with
+# "Connection closed by remote host" or transient auth errors. A small
+# retry budget masks those startup hiccups without papering over real
+# failures (config issues fail consistently across all attempts).
+_TRANSIENT_RE = (
+    "Connection closed by remote host",
+    "Connection reset by peer",
+    "Connection refused",
+    "kex_exchange_identification",
+    "Broken pipe",
+)
 
 
-def _scp_dir(ip: str, port: int, local_dir: Path, remote: str) -> None:
-    subprocess.run(
-        ["scp", "-rq", "-P", str(port),
-         "-o", "StrictHostKeyChecking=no",
-         "-o", "ConnectTimeout=20",
-         str(local_dir), f"root@{ip}:{remote}"],
-        check=True, timeout=180,
-    )
+def _is_transient(stderr: str) -> bool:
+    return any(s in stderr for s in _TRANSIENT_RE)
 
 
-def _ssh(ip: str, port: int, cmd: str, *, timeout: int = 60) -> str:
-    r = subprocess.run(
-        ["ssh", "-T", "-n", "-p", str(port),
-         "-o", "StrictHostKeyChecking=no",
-         "-o", "ConnectTimeout=20",
-         f"root@{ip}", cmd],
-        capture_output=True, text=True, timeout=timeout,
-    )
-    out = (r.stdout + r.stderr).strip()
-    if r.returncode != 0:
-        raise RuntimeError(f"SSH failed (exit {r.returncode}): {out}")
-    return out
+def _scp(ip: str, port: int, local: Path, remote: str, *, retries: int = 2) -> None:
+    last: Exception | None = None
+    for attempt in range(retries + 1):
+        try:
+            subprocess.run(
+                ["scp", "-q", "-P", str(port),
+                 "-o", "StrictHostKeyChecking=no",
+                 "-o", "ConnectTimeout=20",
+                 str(local), f"root@{ip}:{remote}"],
+                check=True, capture_output=True, text=True, timeout=120,
+            )
+            return
+        except subprocess.CalledProcessError as e:
+            last = e
+            if attempt < retries and _is_transient(e.stderr or ""):
+                time.sleep(5)
+                continue
+            raise
+        except subprocess.TimeoutExpired as e:
+            last = e
+            if attempt < retries:
+                time.sleep(5)
+                continue
+            raise
+    if last:  # unreachable in practice — every path above either returns or raises
+        raise last
+
+
+def _scp_dir(ip: str, port: int, local_dir: Path, remote: str, *, retries: int = 2) -> None:
+    last: Exception | None = None
+    for attempt in range(retries + 1):
+        try:
+            subprocess.run(
+                ["scp", "-rq", "-P", str(port),
+                 "-o", "StrictHostKeyChecking=no",
+                 "-o", "ConnectTimeout=20",
+                 str(local_dir), f"root@{ip}:{remote}"],
+                check=True, capture_output=True, text=True, timeout=180,
+            )
+            return
+        except subprocess.CalledProcessError as e:
+            last = e
+            if attempt < retries and _is_transient(e.stderr or ""):
+                time.sleep(5)
+                continue
+            raise
+        except subprocess.TimeoutExpired as e:
+            last = e
+            if attempt < retries:
+                time.sleep(5)
+                continue
+            raise
+    if last:
+        raise last
+
+
+def _ssh(ip: str, port: int, cmd: str, *, timeout: int = 60, retries: int = 2) -> str:
+    last: Exception | None = None
+    for attempt in range(retries + 1):
+        try:
+            r = subprocess.run(
+                ["ssh", "-T", "-n", "-p", str(port),
+                 "-o", "StrictHostKeyChecking=no",
+                 "-o", "ConnectTimeout=20",
+                 f"root@{ip}", cmd],
+                capture_output=True, text=True, timeout=timeout,
+            )
+            out = (r.stdout + r.stderr).strip()
+            if r.returncode != 0:
+                # Retry only on transient SSH-layer failures. App-level
+                # non-zero exits (apt failure, etc.) fall through to raise.
+                if attempt < retries and _is_transient(r.stderr or ""):
+                    time.sleep(5)
+                    continue
+                raise RuntimeError(f"SSH failed (exit {r.returncode}): {out}")
+            return out
+        except subprocess.TimeoutExpired as e:
+            last = e
+            if attempt < retries:
+                time.sleep(5)
+                continue
+            raise
+    if last:
+        raise last
+    return ""
 
 
 def main() -> None:
@@ -150,6 +222,12 @@ def main() -> None:
         # 2. Wait for SSH
         write_state("running", "Waiting for SSH ...", pod_id=pod_id, run_tag=run_tag)
         ip, port = runpod_api.wait_for_pod(pod_id)
+        # wait_for_pod returns as soon as the TCP port accepts a connection,
+        # but RunPod's pod is often still finalizing sshd / package manager
+        # state. Without this settle delay, the very first SCP of the run
+        # routinely dies with "Connection closed by remote host" — the
+        # daemon accepts our handshake then drops it mid-stream.
+        time.sleep(15)
         write_state("running", f"Pod SSH ready ({ip}:{port})",
                     pod_id=pod_id, pod_ip=ip, pod_port=port, run_tag=run_tag)
         print(f"SSH: ssh -p {port} root@{ip}")
@@ -182,10 +260,16 @@ def main() -> None:
         write_state("running", "Launching pod_setup.sh in screen session 'cs659' ...",
                     pod_id=pod_id, pod_ip=ip, pod_port=port, run_tag=run_tag)
 
-        # First install screen + ensure pod has it
+        # First install screen + ensure pod has it. `command -v screen`
+        # short-circuits the slow path when the image already ships screen
+        # (the RunPod pytorch devel image sometimes does). When we DO need
+        # apt, the timeout has to cover `apt-get update` against potentially
+        # cold mirrors plus a small package install — 120 s was tight on
+        # slow RunPod-provider networks; bumped to 300 s.
         _ssh(ip, port,
-             "apt-get update -qq && apt-get install -y -qq screen",
-             timeout=120)
+             "command -v screen >/dev/null 2>&1 || "
+             "(apt-get update -qq && apt-get install -y -qq screen)",
+             timeout=300)
 
         # Launch the orchestrator screen session. We stash the env vars
         # via .bashrc-style export so the screen child inherits them.
