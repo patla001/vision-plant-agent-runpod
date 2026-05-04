@@ -29,7 +29,16 @@ async function terminatePod(podId: string): Promise<{ ok: boolean; error?: strin
     });
     if (!resp.ok) return { ok: false, error: `RunPod API ${resp.status}` };
     const body = await resp.json();
-    if (body.errors) return { ok: false, error: JSON.stringify(body.errors) };
+    if (body.errors) {
+      // Pod already gone (manually terminated, eviction, or earlier abort)
+      // is not a failure — treat as success so the abort flow completes
+      // and the local state still gets cleared.
+      const podNotFound = body.errors.some(
+        (e: { extensions?: { code?: string } }) => e.extensions?.code === "POD_NOT_FOUND",
+      );
+      if (podNotFound) return { ok: true };
+      return { ok: false, error: JSON.stringify(body.errors) };
+    }
     return { ok: true };
   } catch (e: unknown) {
     return { ok: false, error: e instanceof Error ? e.message : String(e) };
@@ -50,7 +59,10 @@ function killProcess(pid: number): { ok: boolean; error?: string } {
 
 export async function POST() {
   const st = readState();
-  if (st.status !== "running") {
+  // "running" is the legacy laptop-resident orchestrator state; "running-on-pod"
+  // is the detached pod-side state from PR #20. Both should accept abort —
+  // otherwise the dashboard's abort button does nothing for pod-side runs.
+  if (st.status !== "running" && st.status !== "running-on-pod") {
     return NextResponse.json({ error: "No running pipeline to abort." }, { status: 409 });
   }
 
