@@ -126,7 +126,24 @@ _TOOLS = [
 ]
 
 
-def make_executor(client: anthropic.Anthropic, results_dir: Path, run_tag: str, repo_dir: Path):
+def make_executor(
+    client: anthropic.Anthropic,
+    results_dir: Path,
+    run_tag: str,
+    repo_dir: Path,
+    *,
+    state: dict | None = None,
+):
+    """Build the tool executor closure.
+
+    `state` is an out-parameter dict the post-loop safety net inspects to
+    decide whether the agent successfully created the Release. Keys set:
+      - release_created: bool — True only after a successful upload_all
+      - release_url: str | None — populated alongside release_created
+    Without this, a `create_github_release` tool that raises mid-upload (or
+    that the agent skipped entirely on its way to self_terminate) would
+    leave us with no durable artifact and no way for main() to know.
+    """
     pod_id = os.environ.get("RUNPOD_POD_ID")
     gh_token = os.environ.get("GITHUB_TOKEN")
     owner, repo = github_release_tool.resolve_owner_repo(repo_dir)
@@ -220,6 +237,14 @@ def make_executor(client: anthropic.Anthropic, results_dir: Path, run_tag: str, 
                 "uploaded_at":  datetime.now(timezone.utc).isoformat(),
             }, indent=2))
 
+            # Mark the Release as durably persisted *only* after upload_all
+            # has returned. If we set this earlier, a mid-upload exception
+            # could leave the agent thinking the artifact is safe when it
+            # isn't, and the post-loop fallback would then skip the recovery.
+            if state is not None:
+                state["release_created"] = True
+                state["release_url"]     = release_url
+
             return f"Release {run_tag} created at {release_url} with {len(files)} assets."
 
         if name == "self_terminate":
@@ -289,22 +314,112 @@ def main() -> None:
         return
 
     client = anthropic.Anthropic()
-    summary = run_agent_loop(
-        client=client,
-        agent_name="PodOrchestrator",
-        system_prompt=_SYSTEM,
-        tools=_TOOLS,
-        initial_message=(
-            f"Training has completed successfully. Run tag: {args.run_tag}.\n"
-            f"Results directory: {args.results_dir}.\n"
-            "Proceed: analyze_results → suggest_hyperparameters → "
-            "create_github_release → self_terminate."
-        ),
-        tool_executor=make_executor(client, args.results_dir, args.run_tag, args.repo_dir),
-        model="claude-opus-4-7",
-        max_iterations=20,
-    )
-    _log("PodOrchestrator", f"Done. Summary: {summary[:200]}")
+
+    # Tracks whether create_github_release actually finished uploading. The
+    # post-loop fallback below is the durability backstop — without it, an
+    # agent that skips/crashes the release tool would let pod_setup.sh's
+    # belt-and-braces self-terminate the pod with the user's results stranded
+    # on disk that's about to be wiped.
+    state: dict = {"release_created": False, "release_url": None}
+    executor = make_executor(client, args.results_dir, args.run_tag, args.repo_dir, state=state)
+
+    try:
+        summary = run_agent_loop(
+            client=client,
+            agent_name="PodOrchestrator",
+            system_prompt=_SYSTEM,
+            tools=_TOOLS,
+            initial_message=(
+                f"Training has completed successfully. Run tag: {args.run_tag}.\n"
+                f"Results directory: {args.results_dir}.\n"
+                "Proceed: analyze_results → suggest_hyperparameters → "
+                "create_github_release → self_terminate."
+            ),
+            tool_executor=executor,
+            model="claude-opus-4-7",
+            max_iterations=20,
+        )
+        _log("PodOrchestrator", f"Done. Summary: {summary[:200]}")
+    except Exception as exc:
+        # Don't let an agent-loop crash skip the fallback. The pod is about
+        # to die regardless (belt-and-braces in pod_setup.sh); we just want
+        # one more chance to push artifacts before that happens.
+        import traceback
+        _log("PodOrchestrator", f"Agent loop raised: {type(exc).__name__}: {exc}")
+        traceback.print_exc()
+
+    if not state["release_created"]:
+        _log("PodOrchestrator",
+             "Agent did not produce a published Release — running direct-upload fallback.")
+        _release_fallback_upload(args)
+    else:
+        _log("PodOrchestrator", f"Release confirmed at {state['release_url']}")
+
+
+def _release_fallback_upload(args) -> None:
+    """Direct (non-Claude) Release upload for the success-path safety net.
+
+    Runs when training succeeded but the agent loop didn't manage to publish
+    a complete Release (tool crashed, agent skipped the call, agent hit
+    max_iterations on a flaky upload, etc.). Tries to be idempotent:
+      - reuses an existing Release for this tag if the agent created one but
+        died before upload_all finished;
+      - otherwise creates a fresh one.
+
+    Any failure is logged but never raises — we don't want this safety net
+    to itself become the reason the pod stays alive. pod_setup.sh's
+    belt-and-braces will terminate the pod regardless.
+    """
+    gh_token = os.environ.get("GITHUB_TOKEN")
+    if not gh_token:
+        _log("PodOrchestrator", "Fallback: GITHUB_TOKEN missing; skipping upload.")
+        return
+    try:
+        owner, repo = github_release_tool.resolve_owner_repo(args.repo_dir)
+    except Exception as exc:
+        _log("PodOrchestrator", f"Fallback: cannot resolve owner/repo: {exc}")
+        return
+
+    try:
+        existing = github_release_tool.find_release_by_tag(owner, repo, args.run_tag, gh_token)
+    except Exception as exc:
+        _log("PodOrchestrator", f"Fallback: find_release_by_tag failed: {exc}")
+        existing = None
+
+    try:
+        if existing is None:
+            rel = github_release_tool.create_release(
+                owner=owner, repo=repo, tag=args.run_tag,
+                name=f"{args.run_tag} (fallback upload)",
+                body=("Created by pod_orchestrator's safety-net fallback. "
+                      "Training succeeded but the Claude-driven release step "
+                      "did not complete — artifacts attached directly."),
+                token=gh_token,
+            )
+            _log("PodOrchestrator", f"Fallback: created Release {rel['html_url']}")
+        else:
+            rel = existing
+            _log("PodOrchestrator", f"Fallback: reusing existing Release {rel['html_url']}")
+
+        files = github_release_tool.collect_artifact_files(args.results_dir)
+        _log("PodOrchestrator", f"Fallback: uploading {len(files)} files ...")
+        github_release_tool.upload_all(rel["id"], owner, repo, files, gh_token)
+
+        # Persist the URL so the dashboard's poll-pod / sync-release routes
+        # find it the same way they would on the happy path.
+        (args.results_dir / "github_release.json").write_text(json.dumps({
+            "tag":          args.run_tag,
+            "html_url":     rel["html_url"],
+            "release_id":   rel["id"],
+            "asset_count":  len(files),
+            "uploaded_at":  datetime.now(timezone.utc).isoformat(),
+            "via_fallback": True,
+        }, indent=2))
+        _log("PodOrchestrator",
+             f"Fallback complete: {len(files)} assets at {rel['html_url']}")
+    except Exception as exc:
+        _log("PodOrchestrator",
+             f"Fallback upload failed: {type(exc).__name__}: {exc}")
 
 
 def _emergency_cleanup(args) -> None:
