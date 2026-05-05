@@ -29,8 +29,17 @@ def create_pod(
     name: str,
     gpu_type: str = "NVIDIA GeForce RTX 4090",
     disk_gb: int = 150,
+    min_memory_gb: int = 29,
+    min_vcpu_count: int = 8,
 ) -> str:
-    """Create an on-demand pod. Returns pod_id."""
+    """Create an on-demand pod. Returns pod_id.
+
+    `min_memory_gb` is the floor RunPod will use when matching the pod onto a
+    physical host. Caller should pass agents._constants.RUNPOD_MIN_MEMORY_GB
+    (currently 64) — see that constant for why we pinned it above the historic
+    29 GiB default. Default kept at 29 here to preserve back-compat with any
+    out-of-tree caller, not because 29 is recommended.
+    """
     data = _call(
         """
         mutation CreatePod($input: PodFindAndDeployOnDemandInput!) {
@@ -46,8 +55,8 @@ def create_pod(
                 "gpuCount": 1,
                 "volumeInGb": 0,
                 "containerDiskInGb": disk_gb,
-                "minVcpuCount": 8,
-                "minMemoryInGb": 29,
+                "minVcpuCount": min_vcpu_count,
+                "minMemoryInGb": min_memory_gb,
                 "ports": "22/tcp",
                 "supportPublicIp": True,
                 "startSsh": True,
