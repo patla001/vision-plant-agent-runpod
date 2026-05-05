@@ -44,7 +44,7 @@ sys.path.insert(0, str(SCRIPTS_DIR / "agents"))
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 from pipeline_state import write_state, write_error
-from _constants     import RUNPOD_GPU_TYPE, RUNPOD_DISK_GB
+from _constants     import RUNPOD_GPU_TYPE, RUNPOD_DISK_GB, RUNPOD_MIN_MEMORY_GB, RUNPOD_MIN_VCPU_COUNT
 import runpod_api
 
 
@@ -341,6 +341,8 @@ def main() -> None:
             name="cs659-cnn-training",
             gpu_type=RUNPOD_GPU_TYPE,
             disk_gb=RUNPOD_DISK_GB,
+            min_memory_gb=RUNPOD_MIN_MEMORY_GB,
+            min_vcpu_count=RUNPOD_MIN_VCPU_COUNT,
         )
         write_state("running", f"Pod created: {pod_id}", pod_id=pod_id, run_tag=run_tag)
         print(f"Pod created: {pod_id}")
