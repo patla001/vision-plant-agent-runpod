@@ -10,6 +10,12 @@ const GIT_CFG = path.join(ROOT, ".git", "config");
 const RUNPOD_GQL = "https://api.runpod.io/graphql";
 const GH_API     = "https://api.github.com";
 
+// Force the route handler to run on every request. Without this, Next 14
+// caches the response when it can't see dynamic inputs (we read state via
+// fs.readFileSync which Next doesn't track), so the dashboard kept showing
+// alive:true on a pod that had been gone for hours.
+export const dynamic = "force-dynamic";
+
 // Combined status of a pod-side run. The dashboard uses this to render the
 // reattach view when the user comes back hours later.
 //
@@ -50,6 +56,10 @@ async function getPodState(podId: string): Promise<{ alive: boolean; desiredStat
         query: `query Pod($id: String!) { pod(input:{podId:$id}) { id desiredStatus runtime { uptimeInSeconds } } }`,
         variables: { id: podId },
       }),
+      // Next 14 caches identical fetch URLs by default. Without no-store the
+      // dashboard kept reporting alive:true on a pod that had been gone for
+      // hours — the user's session went silently blind to a dead pod.
+      cache: "no-store",
       signal: AbortSignal.timeout(12_000),
     });
     if (!r.ok) return { alive: false, desiredStatus: null, error: `RunPod ${r.status}` };
@@ -74,6 +84,7 @@ async function getRelease(owner: string, repo: string, tag: string): Promise<{ u
   try {
     const r = await fetch(`${GH_API}/repos/${owner}/${repo}/releases/tags/${tag}`, {
       headers,
+      cache: "no-store",
       signal: AbortSignal.timeout(12_000),
     });
     if (r.status === 404) return null;
