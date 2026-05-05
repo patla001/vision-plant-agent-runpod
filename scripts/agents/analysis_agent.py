@@ -185,11 +185,21 @@ def _execute_tool(name: str, inputs: dict) -> str:
         return p.read_text() if p else "hyperparameters_snapshot.json not found."
 
     if name == "read_done_info":
-        # The DONE file was downloaded as part of the results rsync
-        p = run_dir.parent.parent / "DONE"   # /workspace/DONE landed at results/DONE
-        if not p.exists():
-            p = run_dir / "DONE"
-        return p.read_text() if p.exists() else "DONE file not found locally."
+        # On the pod, training_wrapper writes DONE at /workspace/DONE — one
+        # level ABOVE results_dir (/workspace/results). The previous code
+        # used run_dir.parent.parent, which on the pod resolves to / and on
+        # the laptop resolves to the repo root — both wrong. The result
+        # was every analysis run reporting "DONE file not found locally"
+        # and the LLM concluding training had crashed mid-run, even on
+        # successful runs that shipped a fully populated Release.
+        for candidate in (
+            run_dir.parent / "DONE",   # pod-side: /workspace/DONE
+            run_dir        / "DONE",   # laptop fallback if synced into run_dir
+            run_dir.parent.parent / "DONE",   # legacy path, kept just in case
+        ):
+            if candidate.exists():
+                return candidate.read_text()
+        return "DONE file not found locally."
 
     if name == "save_analysis_report":
         out = run_dir / "analysis_report.md"
