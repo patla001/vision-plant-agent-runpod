@@ -82,6 +82,22 @@ The dashboard's `PodLiveLog` panel (auto-polls every 10 s) is the primary instru
 5. **Then** terminate the pod: query the RunPod GraphQL `podTerminate` mutation with `Authorization: Bearer <key>` (never embed the key in the URL).
 6. **Update `last_run.json`** with `outcome: "completed_synced"` and the release URL so the dashboard reflects reality.
 
+## Token-permission gotcha (learned the hard way)
+
+**`permissions.push: True` on `GET /repos/{owner}/{repo}` does NOT mean the token can write.** That field reports the *authenticated user's* role on the repo — for a fine-grained PAT issued to the repo owner, it'll always show `admin: True` regardless of what the token is actually scoped for. The token can be (and often is) tighter than the user.
+
+The only reliable preflight is to **actually attempt the write**:
+
+```python
+# POST a draft release (no tag is materialized for drafts), check 201.
+# If 201: immediately DELETE it.
+# If 403: token genuinely lacks Contents:write — fail fast.
+```
+
+`scripts/agents/laptop_bootstrap.py::_preflight_github_token()` does this. If you find yourself adding a permission check that uses `permissions.<flag>` from a `GET /repos` response, you're about to repeat the bug that lost the user a 6-hour run.
+
+The cheap sanity-check (GET /repos with token, look for 401/404) is still worth doing first — surfaces invalid/expired tokens with cleaner errors before the write attempt.
+
 ## What NOT to do
 
 - **Do NOT terminate the pod before SCP-ing results.** The disk is destroyed with the pod and there is no undo.

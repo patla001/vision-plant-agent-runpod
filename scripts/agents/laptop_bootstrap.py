@@ -157,24 +157,28 @@ def _ssh(ip: str, port: int, cmd: str, *, timeout: int = 60, retries: int = 2) -
 
 
 def _preflight_github_token() -> None:
-    """Verify GITHUB_TOKEN can write Releases on the target repo BEFORE we
-    pay for a pod. A 6-hour run that ends with the orchestrator getting
-    HTTP 403 from create_release is the most expensive way to discover a
-    misconfigured token — fail fast here instead.
+    """Verify GITHUB_TOKEN can ACTUALLY create Releases — not just read the repo.
 
-    Strategy: GET /repos/{owner}/{repo} with the token; the response's
-    `permissions.push` flag is True iff the authenticated user has at
-    least Maintain access (which is what's required to create Releases).
-    Works for both classic PATs and fine-grained PATs.
+    Earlier versions of this preflight checked the `permissions.push` flag on
+    GET /repos/{owner}/{repo}. That field reports the *authenticated user's*
+    role on the repo, NOT the token's scoped capabilities. A fine-grained PAT
+    issued to a repo owner returns push:True even when the token itself lacks
+    Contents:write — and the orchestrator still 403s on create_release. This
+    fooled us into burning a full 6-hour run before discovering the gap.
+
+    The only reliable check is to attempt the actual operation. Strategy:
+    POST /releases with draft=true (does NOT materialize a tag — a draft only
+    references a tag name, the tag is created on publish); on 200/201 we
+    immediately DELETE the draft. CREATE 201 + DELETE 204 = the orchestrator
+    will succeed at second 0 of the next pod's existence.
     """
     import re
+    import time as _time
     import urllib.parse
     import requests
 
     token = os.environ["GITHUB_TOKEN"]
 
-    # Resolve owner/repo from the local git origin — same heuristic the
-    # github_release_tool module uses on the pod side.
     try:
         out = subprocess.check_output(
             ["git", "-C", str(REPO_ROOT), "remote", "get-url", "origin"],
@@ -188,45 +192,89 @@ def _preflight_github_token() -> None:
         print(f"Warning: origin {out!r} is not GitHub; skipping token preflight.", file=sys.stderr)
         return
     owner, repo = m.group(1), m.group(2)
+    base = f"https://api.github.com/repos/{urllib.parse.quote(owner)}/{urllib.parse.quote(repo)}"
+    hdr  = {
+        "Authorization": f"Bearer {token}",
+        "Accept":        "application/vnd.github+json",
+    }
 
+    # Cheap sanity check first — surfaces 401/404 with the cleanest error message
+    # before we attempt a write that would cascade-fail with the same root cause.
     try:
-        r = requests.get(
-            f"https://api.github.com/repos/{urllib.parse.quote(owner)}/{urllib.parse.quote(repo)}",
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Accept":        "application/vnd.github+json",
-            },
-            timeout=10,
-        )
+        sanity = requests.get(base, headers=hdr, timeout=10)
     except requests.RequestException as exc:
         print(f"Warning: GitHub preflight network error ({exc}); proceeding anyway.",
               file=sys.stderr)
         return
-
-    if r.status_code == 401:
+    if sanity.status_code == 401:
         print(f"Error: GITHUB_TOKEN is invalid or expired (HTTP 401 from {owner}/{repo}).",
               file=sys.stderr)
         sys.exit(1)
-    if r.status_code == 404:
+    if sanity.status_code == 404:
         print(f"Error: GITHUB_TOKEN cannot see {owner}/{repo}. "
               "If this is a fine-grained PAT, ensure it has access to this repository.",
               file=sys.stderr)
         sys.exit(1)
-    if r.status_code != 200:
-        print(f"Error: GitHub preflight returned HTTP {r.status_code} for {owner}/{repo}.",
+
+    # The actual write test. Draft releases are not visible publicly and don't
+    # create a Git tag (the tag is materialized only when the draft is
+    # published), so even if the DELETE below fails the only side-effect is a
+    # private draft cluttering the Releases UI.
+    test_tag = f"preflight-{int(_time.time())}"
+    try:
+        cr = requests.post(
+            f"{base}/releases",
+            headers=hdr,
+            json={"tag_name": test_tag, "name": "preflight (auto-deleted)", "draft": True},
+            timeout=15,
+        )
+    except requests.RequestException as exc:
+        print(f"Warning: preflight write network error ({exc}); proceeding anyway.",
+              file=sys.stderr)
+        return
+
+    if cr.status_code == 403:
+        # The exact failure mode that motivated this check.
+        try:
+            msg = cr.json().get("message", "(no message)")
+        except ValueError:
+            msg = cr.text[:200]
+        print(
+            f"Error: GITHUB_TOKEN cannot create Releases on {owner}/{repo}.\n"
+            f"  GitHub says: {msg}\n"
+            f"  Fix this BEFORE re-running, otherwise the pod will train for hours\n"
+            f"  and the orchestrator will fail to upload artifacts.\n"
+            f"\n"
+            f"  Fine-grained PAT (https://github.com/settings/personal-access-tokens):\n"
+            f"    Repository access → confirm '{owner}/{repo}' is in the list\n"
+            f"    Repository permissions → Contents → 'Read and write'\n"
+            f"\n"
+            f"  Classic PAT (https://github.com/settings/tokens):\n"
+            f"    Generate new (classic) → tick 'repo' scope",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if cr.status_code not in (200, 201):
+        print(f"Error: preflight create returned HTTP {cr.status_code}: {cr.text[:300]}",
               file=sys.stderr)
         sys.exit(1)
 
-    body = r.json()
-    perms = (body or {}).get("permissions") or {}
-    if not perms.get("push"):
-        print(f"Error: GITHUB_TOKEN authenticated but lacks write access on "
-              f"{owner}/{repo} (permissions={perms}). Releases need at least "
-              "Contents: write — fix the token's scope before re-running.",
-              file=sys.stderr)
-        sys.exit(1)
+    # Tear down the draft. Failure here is non-fatal but worth flagging so the
+    # user knows to clean it up manually.
+    rid = cr.json().get("id")
+    if rid:
+        try:
+            dr = requests.delete(f"{base}/releases/{rid}", headers=hdr, timeout=15)
+            if dr.status_code != 204:
+                print(f"Warning: failed to delete preflight draft release {rid} "
+                      f"(HTTP {dr.status_code}). Clean it up manually at "
+                      f"https://github.com/{owner}/{repo}/releases", file=sys.stderr)
+        except requests.RequestException as exc:
+            print(f"Warning: delete preflight draft network error ({exc}); "
+                  f"manually delete release {rid} at https://github.com/{owner}/{repo}/releases",
+                  file=sys.stderr)
 
-    print(f"GITHUB_TOKEN ✓ — push access confirmed on {owner}/{repo}.")
+    print(f"GITHUB_TOKEN ✓ — verified write access on {owner}/{repo} via draft create+delete.")
 
 
 def main() -> None:
