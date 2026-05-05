@@ -156,6 +156,79 @@ def _ssh(ip: str, port: int, cmd: str, *, timeout: int = 60, retries: int = 2) -
     return ""
 
 
+def _preflight_github_token() -> None:
+    """Verify GITHUB_TOKEN can write Releases on the target repo BEFORE we
+    pay for a pod. A 6-hour run that ends with the orchestrator getting
+    HTTP 403 from create_release is the most expensive way to discover a
+    misconfigured token — fail fast here instead.
+
+    Strategy: GET /repos/{owner}/{repo} with the token; the response's
+    `permissions.push` flag is True iff the authenticated user has at
+    least Maintain access (which is what's required to create Releases).
+    Works for both classic PATs and fine-grained PATs.
+    """
+    import re
+    import urllib.parse
+    import requests
+
+    token = os.environ["GITHUB_TOKEN"]
+
+    # Resolve owner/repo from the local git origin — same heuristic the
+    # github_release_tool module uses on the pod side.
+    try:
+        out = subprocess.check_output(
+            ["git", "-C", str(REPO_ROOT), "remote", "get-url", "origin"],
+            text=True, stderr=subprocess.DEVNULL,
+        ).strip()
+    except subprocess.CalledProcessError:
+        print("Warning: cannot resolve origin URL; skipping token preflight.", file=sys.stderr)
+        return
+    m = re.match(r"(?:https://github\.com/|git@github\.com:)([^/]+)/([^/]+?)(?:\.git)?/?$", out)
+    if not m:
+        print(f"Warning: origin {out!r} is not GitHub; skipping token preflight.", file=sys.stderr)
+        return
+    owner, repo = m.group(1), m.group(2)
+
+    try:
+        r = requests.get(
+            f"https://api.github.com/repos/{urllib.parse.quote(owner)}/{urllib.parse.quote(repo)}",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept":        "application/vnd.github+json",
+            },
+            timeout=10,
+        )
+    except requests.RequestException as exc:
+        print(f"Warning: GitHub preflight network error ({exc}); proceeding anyway.",
+              file=sys.stderr)
+        return
+
+    if r.status_code == 401:
+        print(f"Error: GITHUB_TOKEN is invalid or expired (HTTP 401 from {owner}/{repo}).",
+              file=sys.stderr)
+        sys.exit(1)
+    if r.status_code == 404:
+        print(f"Error: GITHUB_TOKEN cannot see {owner}/{repo}. "
+              "If this is a fine-grained PAT, ensure it has access to this repository.",
+              file=sys.stderr)
+        sys.exit(1)
+    if r.status_code != 200:
+        print(f"Error: GitHub preflight returned HTTP {r.status_code} for {owner}/{repo}.",
+              file=sys.stderr)
+        sys.exit(1)
+
+    body = r.json()
+    perms = (body or {}).get("permissions") or {}
+    if not perms.get("push"):
+        print(f"Error: GITHUB_TOKEN authenticated but lacks write access on "
+              f"{owner}/{repo} (permissions={perms}). Releases need at least "
+              "Contents: write — fix the token's scope before re-running.",
+              file=sys.stderr)
+        sys.exit(1)
+
+    print(f"GITHUB_TOKEN ✓ — push access confirmed on {owner}/{repo}.")
+
+
 def main() -> None:
     # Required env vars: ANTHROPIC + RUNPOD always; GITHUB_TOKEN now too because
     # the pod orchestrator needs it to publish Releases.
@@ -165,6 +238,11 @@ def main() -> None:
         print(f"Error: missing environment variables: {', '.join(missing)}", file=sys.stderr)
         print("Add them to .env in the repo root (see .env.example).", file=sys.stderr)
         sys.exit(1)
+
+    # Validate token write access before spending money on a pod. An invalid
+    # token surfaces as a 6-hour run ending with HTTP 403 from create_release;
+    # this turns that into a fail-fast at second 0.
+    _preflight_github_token()
 
     color_correct = os.environ.get("PIPELINE_COLOR_CORRECT") or None
     if color_correct and color_correct not in VALID_COLOR_CORRECT:
@@ -254,8 +332,17 @@ def main() -> None:
 
         # 4. Launch pod_setup.sh inside a detached screen session.
         # `setsid` + redirect ensures the SSH command returns immediately.
-        cc_export = f"COLOR_CORRECT={color_correct} " if color_correct else ""
+        cc_export      = f"COLOR_CORRECT={color_correct} " if color_correct else ""
         run_tag_export = f"RUN_TAG={run_tag} "
+        # CRITICAL: RUNPOD_POD_ID is set by RunPod's container init but does
+        # NOT propagate into SSH sessions — sshd starts a fresh login shell
+        # whose env comes from /etc/environment + ~/.bashrc, not from PID 1.
+        # Both the orchestrator's self_terminate and pod_setup.sh's EXIT-trap
+        # safety net read this var; without it the pod cannot terminate
+        # itself and bills until manually killed (the failure mode that
+        # produced the 6h-stuck pod). We know the id locally — pass it
+        # through the screen's env explicitly.
+        pod_id_export  = f"RUNPOD_POD_ID={pod_id} "
 
         write_state("running", "Launching pod_setup.sh in screen session 'cs659' ...",
                     pod_id=pod_id, pod_ip=ip, pod_port=port, run_tag=run_tag)
@@ -283,7 +370,7 @@ def main() -> None:
             "set -e && "
             "chmod +x /workspace/pod_setup.sh && "
             "rm -f /workspace/setup.log && "
-            f"( setsid env {cc_export}{run_tag_export}"
+            f"( setsid env {cc_export}{run_tag_export}{pod_id_export}"
             "    screen -dmS cs659 -L -Logfile /workspace/setup.log "
             "    bash /workspace/pod_setup.sh "
             "    > /dev/null 2>&1 < /dev/null ) && "
