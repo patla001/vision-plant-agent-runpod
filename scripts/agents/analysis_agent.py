@@ -112,8 +112,32 @@ def _latest_run_dir() -> Path | None:
 
 
 def _find_file(run_dir: Path, *names: str) -> Path | None:
-    """Search run_dir and its single_split/ subdirectory for any of the given filenames."""
-    candidates = [run_dir] + list(run_dir.glob("single_split")) + list(run_dir.glob("fold_*"))
+    """Search run_dir and its known per-split subdirs for any of the given filenames.
+
+    Layouts seen in the wild (oldest → newest):
+      run_dir/<file>                          flat
+      run_dir/single_split/<file>             k_folds=1 wrapper layout
+      run_dir/fold_*/<file>                   k-fold cross-validation layout
+      run_dir/split_metrics/<split>/<file>    per-split metrics directory
+                                               (split ∈ train, validation, test)
+
+    The split_metrics/test/ branch is what trips analyses today: training
+    writes classification_report.txt there but the agent used to only look
+    at single_split/, returning "not found" and forcing the LLM to write
+    a fact-free analysis.
+    """
+    candidates = [run_dir]
+    candidates += list(run_dir.glob("single_split"))
+    candidates += list(run_dir.glob("fold_*"))
+    split_metrics = run_dir / "split_metrics"
+    if split_metrics.exists():
+        # Prefer test → val → train when the same filename exists in multiple
+        # per-split subdirs — the test split is what actually matters for
+        # generalization analysis.
+        for sub in ("test", "validation", "train"):
+            d = split_metrics / sub
+            if d.exists():
+                candidates.append(d)
     for search_dir in candidates:
         for name in names:
             p = search_dir / name
@@ -128,12 +152,33 @@ def _execute_tool(name: str, inputs: dict) -> str:
         return "Error: no results directory found. Run training first."
 
     if name == "read_metrics_csv":
-        p = _find_file(run_dir, "metrics_train_val_test.csv")
-        return p.read_text() if p else "metrics_train_val_test.csv not found."
+        # training_wrapper.py writes the per-epoch CSV under several legacy
+        # names depending on git history; prefer the modern name and fall
+        # back. If no CSV exists at all, fall back to the rich JSON summary
+        # at results-dir root — it has train/val/test accuracy, F1, ROC AUC,
+        # and is sufficient to diagnose overfit vs underfit by itself.
+        for fname in ("metrics_metrics_per_epoch.csv", "metrics_per_epoch.csv", "metrics_train_val_test.csv"):
+            p = _find_file(run_dir, fname)
+            if p:
+                return p.read_text()
+        json_p = _find_file(run_dir, "metrics_train_val_test.json")
+        if json_p:
+            return ("[no per-epoch CSV found — returning final-split JSON summary instead]\n"
+                    + json_p.read_text())
+        return "No per-epoch CSV or final-split JSON found in run_dir."
 
     if name == "read_classification_report":
-        p = _find_file(run_dir, "test_classification_report.txt")
-        return p.read_text() if p else "test_classification_report.txt not found."
+        # Modern wrapper names first (metrics_classification_report.txt and
+        # split_metrics/test/classification_report.txt), legacy last.
+        for fname in (
+            "metrics_classification_report.txt",
+            "classification_report.txt",
+            "test_classification_report.txt",
+        ):
+            p = _find_file(run_dir, fname)
+            if p:
+                return p.read_text()
+        return "No classification report found in run_dir."
 
     if name == "read_hyperparameters":
         p = _find_file(run_dir, "hyperparameters_snapshot.json")

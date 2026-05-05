@@ -122,17 +122,60 @@ def suggest(
     run_tag: str,
     model: str = "claude-opus-4-7",
 ) -> dict:
-    """Returns the structured suggestion dict (also written to results_dir)."""
-    # Find a metrics CSV — handle both single_split and fold_*/ layouts
-    csv_candidates = list(results_dir.rglob("metrics_train_val_test.csv"))
-    csv_text = _read_first_lines(csv_candidates[0]) if csv_candidates else "[no metrics CSV found]"
+    """Returns the structured suggestion dict (also written to results_dir).
 
-    report_candidates = list(results_dir.rglob("test_classification_report.txt"))
-    report_text = _truncate(report_candidates[0].read_text(errors="replace") if report_candidates else "[no report]", 4000)
+    File-discovery strategy: training_wrapper.py writes results into a flat
+    /workspace/results/ tree on the pod with these names today —
 
-    # Make the user message compact but informative
+      metrics_train_val_test.json                       (split summary)
+      single_split/metrics_metrics_per_epoch.csv        (per-epoch CSV)
+      single_split/metrics_classification_report.txt    (per-class P/R/F1)
+      split_metrics/test/classification_report.txt      (also per-class)
+
+    Older layouts (and earlier code in this file) looked for
+    metrics_train_val_test.csv and test_classification_report.txt — both
+    of which don't exist anymore. The 2026-05-05 17:40 run silently
+    diagnosed "underfitting" with the reasoning "no metrics CSV or test
+    report was provided" because of this mismatch. We now rglob under
+    multiple historical names AND fall back to the rich
+    metrics_train_val_test.json so the model always has *something* to
+    reason about.
+    """
+    # Per-epoch CSV — try both modern and legacy names
+    csv_candidates = (
+        list(results_dir.rglob("metrics_metrics_per_epoch.csv"))
+        + list(results_dir.rglob("metrics_per_epoch.csv"))
+        + list(results_dir.rglob("metrics_train_val_test.csv"))
+    )
+    csv_text = _read_first_lines(csv_candidates[0]) if csv_candidates else "[no per-epoch CSV found]"
+
+    # Final-split summary JSON — always present at the results-dir root.
+    summary_path = results_dir / "metrics_train_val_test.json"
+    summary_text = (
+        _truncate(summary_path.read_text(errors="replace"), 3000)
+        if summary_path.exists() else "[no summary JSON found]"
+    )
+
+    # Classification report — modern names first, legacy last.
+    report_candidates = (
+        list(results_dir.rglob("metrics_classification_report.txt"))
+        + list((results_dir / "split_metrics" / "test").rglob("classification_report.txt"))
+        + list(results_dir.rglob("classification_report.txt"))
+        + list(results_dir.rglob("test_classification_report.txt"))
+    )
+    report_text = _truncate(
+        report_candidates[0].read_text(errors="replace") if report_candidates else "[no classification report found]",
+        4000,
+    )
+
+    # Make the user message compact but informative. Order matters: summary
+    # JSON is the most compact and reliable signal of overfit vs underfit
+    # so we put it first, then the per-epoch CSV (trajectory), then the
+    # classification report (per-class).
     user_msg = (
-        "TRAINING METRICS (per-epoch CSV):\n"
+        "FINAL METRICS SUMMARY (train/val/test, JSON):\n"
+        f"```json\n{summary_text}\n```\n\n"
+        "PER-EPOCH METRICS (CSV):\n"
         f"```csv\n{csv_text}\n```\n\n"
         "TEST CLASSIFICATION REPORT (head):\n"
         f"```\n{report_text}\n```\n\n"
