@@ -8,6 +8,11 @@ const STATE   = path.join(RESULTS, "pipeline_state.json");
 
 const RUNPOD_GQL = "https://api.runpod.io/graphql";
 
+// Same dynamic-route fix as poll-pod — Next 14 caches GET handlers when it
+// can't see dynamic inputs (we use fs.readFileSync), and a stale list of pods
+// would mean the orphan-cleanup modal lies about what's actually running.
+export const dynamic = "force-dynamic";
+
 interface PodRow {
   id: string;
   name: string | null;
@@ -54,6 +59,7 @@ export async function GET() {
           }
         `,
       }),
+      cache: "no-store",
       signal: AbortSignal.timeout(15_000),
     });
     if (!r.ok) {
