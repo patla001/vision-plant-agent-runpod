@@ -125,22 +125,74 @@ export default function PipelineControl({ initialState, onResultsReady }: Props)
   });
 
   // Lazy-load the AI suggestion when the user picks that mode for the first time.
+  // Also re-callable from the manual upload flow so the picker refreshes
+  // immediately after a successful POST.
+  const fetchAiSuggestion = useCallback(async () => {
+    try {
+      const r = await fetch("/api/results/suggested-hyperparameters");
+      if (r.status === 404) {
+        setAiSuggestion({ error: "No prior AI suggestion found — first run will use defaults, or upload one below." });
+        return;
+      }
+      if (!r.ok) {
+        setAiSuggestion({ error: `Failed to fetch suggestion (HTTP ${r.status})` });
+        return;
+      }
+      setAiSuggestion(await r.json());
+    } catch (e) {
+      setAiSuggestion({ error: e instanceof Error ? e.message : String(e) });
+    }
+  }, []);
   useEffect(() => {
     if (hpMode !== "ai" || aiSuggestion !== null) return;
-    fetch("/api/results/suggested-hyperparameters")
-      .then(async (r) => {
-        if (r.status === 404) {
-          setAiSuggestion({ error: "No prior AI suggestion found — first run will use defaults." });
-          return;
-        }
-        if (!r.ok) {
-          setAiSuggestion({ error: `Failed to fetch suggestion (HTTP ${r.status})` });
-          return;
-        }
-        setAiSuggestion(await r.json());
-      })
-      .catch((e) => setAiSuggestion({ error: e instanceof Error ? e.message : String(e) }));
-  }, [hpMode, aiSuggestion]);
+    void fetchAiSuggestion();
+  }, [hpMode, aiSuggestion, fetchAiSuggestion]);
+
+  // Manual-upload form state. Shown inside the "AI suggested" mode so users
+  // can plug in a suggestion when the pod-side run failed to ship one (the
+  // 2026-05-05 release was missing the suggester JSON despite the run body
+  // claiming otherwise — hence this fallback path).
+  const [manualUploadOpen, setManualUploadOpen] = useState(false);
+  const [manualUploadJson, setManualUploadJson] = useState("");
+  const [manualUploadStatus, setManualUploadStatus] = useState<{ kind: "ok" | "err"; msg: string } | null>(null);
+  const [manualUploadBusy,  setManualUploadBusy ] = useState(false);
+  const handleManualUpload = useCallback(async () => {
+    setManualUploadBusy(true);
+    setManualUploadStatus(null);
+    try {
+      let parsed: Record<string, unknown>;
+      try {
+        parsed = JSON.parse(manualUploadJson);
+      } catch (e) {
+        setManualUploadStatus({ kind: "err", msg: `Invalid JSON: ${e instanceof Error ? e.message : String(e)}` });
+        return;
+      }
+      // Be permissive with the shape: if the user paste just a flat
+      // {epochs: 30, ...} object, wrap it under suggested_hyperparameters.
+      if (parsed && typeof parsed === "object" && !("suggested_hyperparameters" in parsed)) {
+        parsed = { suggested_hyperparameters: parsed };
+      }
+      const r = await fetch("/api/results/suggested-hyperparameters", {
+        method:  "POST",
+        headers: { "Content-Type": "application/json" },
+        body:    JSON.stringify(parsed),
+      });
+      const data = await r.json();
+      if (!r.ok) {
+        setManualUploadStatus({ kind: "err", msg: data.error ?? `HTTP ${r.status}` });
+        return;
+      }
+      const accepted = (data.accepted ?? []).join(", ");
+      setManualUploadStatus({ kind: "ok", msg: `Saved. Accepted: ${accepted || "none"}` });
+      // Refresh the picker so the new suggestion is visible immediately.
+      setAiSuggestion(null);
+      void fetchAiSuggestion();
+    } catch (e) {
+      setManualUploadStatus({ kind: "err", msg: e instanceof Error ? e.message : String(e) });
+    } finally {
+      setManualUploadBusy(false);
+    }
+  }, [manualUploadJson, fetchAiSuggestion]);
 
   /** Build the hyperparameters payload for the start request based on the picked mode. */
   const buildHyperparameters = useCallback((): Record<string, number> | null => {
@@ -833,6 +885,50 @@ export default function PipelineControl({ initialState, onResultsReady }: Props)
                   )}
                 </>
               )}
+
+              {/* Manual upload — for when the previous run's Release didn't
+                  ship a suggester JSON (a known failure mode we saw on the
+                  2026-05-05 run), or when the user wants to override the
+                  AI's suggestion with their own values without using the
+                  separate Manual mode. */}
+              <div className="pt-2 border-t border-slate-800 space-y-1.5">
+                <button
+                  type="button"
+                  onClick={() => setManualUploadOpen((v) => !v)}
+                  className="text-[11px] text-slate-400 hover:text-slate-200 transition"
+                >
+                  {manualUploadOpen ? "▾ Hide manual upload" : "▸ Upload a manual suggestion"}
+                </button>
+                {manualUploadOpen && (
+                  <div className="space-y-1.5">
+                    <textarea
+                      value={manualUploadJson}
+                      onChange={(e) => setManualUploadJson(e.target.value)}
+                      placeholder={`{\n  "epochs": 30,\n  "learning_rate": 0.0001,\n  "dropout": 0.4,\n  "early_stopping_patience": 5\n}`}
+                      rows={6}
+                      className="w-full bg-slate-900/60 border border-slate-700 rounded px-2 py-1.5 text-[11px] font-mono text-slate-200 focus:outline-none focus:border-cyan-400"
+                    />
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={handleManualUpload}
+                        disabled={manualUploadBusy || manualUploadJson.trim() === ""}
+                        className="text-[11px] px-2.5 py-1 rounded border border-cyan-500/40 bg-cyan-500/10 text-cyan-300 hover:bg-cyan-500/20 transition disabled:opacity-50"
+                      >
+                        {manualUploadBusy ? "Saving…" : "Save as AI suggestion"}
+                      </button>
+                      <p className="text-[10px] text-slate-500">
+                        Allowed keys: epochs, learning_rate, dropout, early_stopping_patience
+                      </p>
+                    </div>
+                    {manualUploadStatus && (
+                      <p className={`text-[11px] ${manualUploadStatus.kind === "ok" ? "text-emerald-300" : "text-red-300"}`}>
+                        {manualUploadStatus.msg}
+                      </p>
+                    )}
+                  </div>
+                )}
+              </div>
             </div>
           )}
 

@@ -150,10 +150,13 @@ def make_executor(
 
     def execute(name: str, inputs: dict) -> str:
         if name == "analyze_results":
-            _log("PodOrchestrator", "Spawning AnalysisAgent ...")
-            # analysis_agent.run reads from a results dir; use ours.
-            # We temporarily chdir so any relative reads inside analysis_agent
-            # resolve to our results_dir.
+            _log("PodOrchestrator", f"Spawning AnalysisAgent (results_dir={results_dir}) ...")
+            # Tell analysis_agent exactly where to look. The agent's own
+            # _resolve_results_root() honors CS659_RESULTS_DIR — without
+            # this, analysis falls back to /workspace/results (pod default)
+            # which is correct here but won't be if the orchestrator is
+            # ever pointed at a different dir.
+            os.environ["CS659_RESULTS_DIR"] = str(results_dir)
             old = Path.cwd()
             try:
                 os.chdir(results_dir.parent)
@@ -213,6 +216,31 @@ def make_executor(
         if name == "create_github_release":
             if not gh_token:
                 raise RuntimeError("GITHUB_TOKEN env var not set; cannot create Release.")
+
+            # Belt-and-braces: if the agent skipped suggest_hyperparameters
+            # (or the call errored before its own stub-write fallback fired),
+            # land a "no_suggestion" stub here so the file is guaranteed to
+            # be in collect_artifact_files' must-have list. Without this,
+            # downstream consumers (dashboard's "AI suggested" picker, the
+            # next run's auto-rerun) silently get nothing — the failure mode
+            # the 2026-05-05 release hit.
+            sug_path = results_dir / "suggested_hyperparameters.json"
+            if not sug_path.exists():
+                _log("PodOrchestrator",
+                     "WARNING: suggested_hyperparameters.json missing — writing stub before release.")
+                sug_path.write_text(json.dumps({
+                    "diagnosis":                "no_suggestion",
+                    "reasoning":                "suggest_hyperparameters tool was not run before "
+                                                "create_github_release. Falling back to defaults — "
+                                                "use the dashboard to upload a manual override or "
+                                                "rerun training to regenerate this file.",
+                    "suggested_hyperparameters": {},
+                    "expected_improvement":     "n/a",
+                    "based_on_run":             run_tag,
+                    "produced_at":              datetime.now(timezone.utc).isoformat(),
+                    "current_hyperparameters":  {},
+                }, indent=2) + "\n")
+
             _log("PodOrchestrator", f"Creating Release {run_tag} on {owner}/{repo} ...")
             release = github_release_tool.create_release(
                 owner=owner, repo=repo, tag=run_tag,
@@ -224,7 +252,13 @@ def make_executor(
             _log("PodOrchestrator", f"Release created: {release_url}")
 
             files = github_release_tool.collect_artifact_files(results_dir)
-            _log("PodOrchestrator", f"Uploading {len(files)} artifacts ...")
+            _log("PodOrchestrator", f"Uploading {len(files)} artifacts:")
+            for f in files:
+                try:
+                    size = f.stat().st_size
+                    _log("PodOrchestrator", f"  - {f.relative_to(results_dir)} ({size / 1e3:.1f} KB)")
+                except OSError:
+                    _log("PodOrchestrator", f"  - {f} (stat failed)")
             github_release_tool.upload_all(release_id, owner, repo, files, gh_token)
             _log("PodOrchestrator", "All artifacts uploaded.")
 
@@ -385,6 +419,28 @@ def _release_fallback_upload(args) -> None:
     except Exception as exc:
         _log("PodOrchestrator", f"Fallback: find_release_by_tag failed: {exc}")
         existing = None
+
+    # Same belt-and-braces as the happy-path: guarantee suggested_hyperparameters.json
+    # is on disk before we collect artifacts, so the release contains the file
+    # downstream consumers rely on even when the agent never reached it.
+    sug_path = args.results_dir / "suggested_hyperparameters.json"
+    if not sug_path.exists():
+        _log("PodOrchestrator",
+             "Fallback: suggested_hyperparameters.json missing — writing stub.")
+        try:
+            sug_path.write_text(json.dumps({
+                "diagnosis":                "no_suggestion",
+                "reasoning":                "Agent loop did not produce a suggestion before "
+                                            "the fallback fired. Use the dashboard's "
+                                            "manual upload to provide one, or rerun training.",
+                "suggested_hyperparameters": {},
+                "expected_improvement":     "n/a",
+                "based_on_run":             args.run_tag,
+                "produced_at":              datetime.now(timezone.utc).isoformat(),
+                "current_hyperparameters":  {},
+            }, indent=2) + "\n")
+        except OSError as exc:
+            _log("PodOrchestrator", f"Fallback: stub write failed: {exc}")
 
     try:
         if existing is None:
