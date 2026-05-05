@@ -51,7 +51,7 @@ from experiment_config import (
     validate_split_fractions,
     write_json,
 )
-from metrics_logging import ValidationMetricsCallback, evaluate_cnn_split
+from metrics_logging import ValidationMetricsCallback, evaluate_cnn_split, plot_loss_curves
 
 # --- Small helpers (logging and timing) ---
 
@@ -713,7 +713,7 @@ def main() -> None:
             )
         _log_dataset_steps(train_ds, val_ds, args.batch_size)
         mcb = metrics_cb(val_ds, "single_split", "metrics")
-        model, _ = _train_one(
+        model, history = _train_one(
             train_ds,
             val_ds,
             num_classes=num_classes,
@@ -725,6 +725,12 @@ def main() -> None:
             early_stopping_patience=args.early_stopping_patience,
             extra_callbacks=[mcb] if mcb else None,
         )
+        # Learning curve — the primary over/underfitting signal. Saved at the
+        # top of base_log_dir so it's alongside the run-level summaries
+        # (hyperparameters_snapshot.json, metrics_train_val_test.json) and
+        # gets uploaded to the GitHub Release by collect_artifact_files.
+        if base_log_dir is not None:
+            plot_loss_curves(history.history, base_log_dir)
     else:
         _log(f"Stratified {args.k_folds}-fold CV: hold out test ({args.test_fraction:.2f}), then fold the rest…")
         paths, labels = collect_paths_and_labels_for_classes(
@@ -883,7 +889,7 @@ def main() -> None:
                 )
             _log_dataset_steps(train_ds, val_ds, args.batch_size)
             mcb = metrics_cb(val_ds, "final_retrain", "metrics")
-            model, _ = _train_one(
+            model, history = _train_one(
                 train_ds,
                 val_ds,
                 num_classes=num_classes,
@@ -895,6 +901,8 @@ def main() -> None:
                 early_stopping_patience=args.early_stopping_patience,
                 extra_callbacks=[mcb] if mcb else None,
             )
+            if base_log_dir is not None:
+                plot_loss_curves(history.history, base_log_dir)
 
         test_ds_eval = _make_dataset_from_paths(
             te_paths,

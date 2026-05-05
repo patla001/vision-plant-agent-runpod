@@ -136,6 +136,82 @@ def _short_label(name: str, max_len: int = 22) -> str:
     return n[:max_len].rstrip() + "…"
 
 
+def plot_loss_curves(
+    history: dict[str, list[float]],
+    out_dir: Path,
+    *,
+    filename: str = "loss_vs_epoch.png",
+) -> None:
+    """Plot train_loss and val_loss vs epoch — the primary over/underfitting signal.
+
+    ``history`` is the dict returned by ``model.fit(...).history``; we only
+    look up ``"loss"`` and ``"val_loss"`` so the same function works for any
+    Keras training run, not just this project's CNN. Skipped silently if
+    either key is missing (e.g. a run with no validation data).
+
+    Reading the curve:
+      * both lines descending and converging  → still learning (underfit if
+        both still high at the last epoch);
+      * train loss diving while val loss flattens or rises → overfitting
+        (the gap on the right tells you how badly);
+      * both flat and close to each other     → well-fit, no headroom;
+      * val below train, both wandering       → batch-norm / dropout doing
+        its regularization job — usually fine.
+
+    The dashed vertical line marks the best val_loss epoch — the weights
+    EarlyStopping ``restore_best_weights`` rolls back to, so it's where the
+    model actually finished training even when ``len(history["loss"])``
+    extends past it.
+    """
+    train_loss = history.get("loss")
+    val_loss   = history.get("val_loss")
+    if not train_loss or not val_loss:
+        return
+
+    n = min(len(train_loss), len(val_loss))
+    epochs = np.arange(1, n + 1)
+    tr = np.asarray(train_loss[:n], dtype=np.float64)
+    va = np.asarray(val_loss[:n],   dtype=np.float64)
+
+    fig, ax = plt.subplots(figsize=(9, 6))
+    ax.plot(epochs, tr, marker="o", markersize=4, linewidth=1.8, label="train loss",      color="#1f77b4")
+    ax.plot(epochs, va, marker="s", markersize=4, linewidth=1.8, label="validation loss", color="#d62728")
+
+    best_epoch = int(np.argmin(va)) + 1
+    best_val   = float(va[best_epoch - 1])
+    ax.axvline(best_epoch, color="#7f7f7f", linestyle="--", linewidth=1.0, alpha=0.7)
+    ax.annotate(
+        f"best val_loss = {best_val:.4f}\n@ epoch {best_epoch}",
+        xy=(best_epoch, best_val),
+        xytext=(8, 12),
+        textcoords="offset points",
+        fontsize=8,
+        color="#404040",
+        bbox=dict(boxstyle="round,pad=0.3", facecolor="white", edgecolor="#cccccc", alpha=0.85),
+    )
+
+    final_gap = float(tr[-1] - va[-1])
+    diag = "well-fit" if abs(final_gap) < 0.05 else ("overfitting" if final_gap < -0.05 else "underfitting")
+    ax.text(
+        0.99, 0.97,
+        f"final gap (train − val) = {final_gap:+.3f}\nheuristic: {diag}",
+        transform=ax.transAxes,
+        ha="right", va="top",
+        fontsize=8, color="#404040",
+        bbox=dict(boxstyle="round,pad=0.4", facecolor="white", edgecolor="#cccccc", alpha=0.85),
+    )
+
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Loss (categorical cross-entropy)")
+    ax.set_title("Learning curve — train vs validation loss")
+    ax.set_xticks(epochs)
+    ax.grid(True, alpha=0.25)
+    ax.legend(loc="upper right" if diag != "overfitting" else "lower left")
+    fig.tight_layout()
+    fig.savefig(out_dir / filename, dpi=150)
+    plt.close(fig)
+
+
 def plot_confusion_and_correlation(
     y_true: np.ndarray,
     y_pred: np.ndarray,
