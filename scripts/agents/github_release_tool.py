@@ -122,26 +122,53 @@ def find_release_by_tag(owner: str, repo: str, tag: str, token: str) -> dict | N
     return r.json()
 
 
+# Files we MUST publish if they exist on disk. These are the artifacts the
+# downstream consumers (dashboard's sync-release route, AI-mode hyperparameter
+# picker, manual recovery) actively look for. Listing them by name — instead
+# of relying on rglob alone — gives the upload step a chance to log a loud
+# warning when a critical file is missing, instead of silently dropping it.
+# The 2026-05-05 run shipped a Release with only the .tflite + plots because
+# rglob found nothing under those extensions; the suggester JSON, metrics CSV,
+# and hyperparameters snapshot all went missing without a single log line.
+REQUIRED_ARTIFACTS: tuple[str, ...] = (
+    "plant_classifier_deep_learning.tflite",
+    "suggested_hyperparameters.json",
+    "hyperparameters_snapshot.json",
+    "metrics_train_val_test.json",
+    "split_summary.json",
+    "analysis_report.md",
+    "training.log",
+    "orchestrator.log",
+)
+
+
 def collect_artifact_files(results_dir: Path) -> list[Path]:
     """Return the set of files we want attached to a Release.
 
     Strategy:
-      - The .tflite at the top of results_dir (training_wrapper writes here)
-      - Every .png in any descendant directory (training curves, confusion matrix)
-      - Every .json/.csv in the timestamped run subdir
-      - analysis_report.md if present
+      - First, every file in REQUIRED_ARTIFACTS that exists at the top level —
+        these are the files downstream code actively reads (suggester JSON,
+        snapshot, analysis report). Listing them explicitly means the caller
+        can warn about each missing one by name.
+      - Then every .png / .csv / .json / .txt anywhere under results_dir
+        (rglob), to sweep up per-epoch metrics, ROC plots, label files, etc.
+      - The .tflite is included via REQUIRED_ARTIFACTS, but we also keep the
+        explicit add for backwards compatibility with anything calling this
+        with a results_dir that doesn't satisfy the named-file checks.
     """
     files: list[Path] = []
 
-    tflite = results_dir / "plant_classifier_deep_learning.tflite"
-    if tflite.exists():
-        files.append(tflite)
+    # Tier 1 — must-haves at top of results_dir.
+    for name in REQUIRED_ARTIFACTS:
+        p = results_dir / name
+        if p.exists():
+            files.append(p)
+        else:
+            print(f"[github_release] WARNING: expected artifact missing: {name}", flush=True)
 
-    report = results_dir / "analysis_report.md"
-    if report.exists():
-        files.append(report)
-
-    for ext in ("*.png", "*.csv", "*.json", "*.txt"):
+    # Tier 2 — sweep every plot / CSV / JSON / TXT in any subdir
+    # (per-epoch metrics, ROC plots, label files, etc.)
+    for ext in ("*.png", "*.csv", "*.json", "*.txt", "*.md", "*.log"):
         files.extend(sorted(results_dir.rglob(ext)))
 
     # De-duplicate while preserving order

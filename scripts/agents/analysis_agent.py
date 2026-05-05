@@ -5,6 +5,7 @@ Spawned by the Orchestrator after results are downloaded locally.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import anthropic
@@ -65,14 +66,45 @@ _TOOLS = [
     },
 ]
 
-RESULTS_ROOT = Path(__file__).parent.parent.parent / "results"
+# Resolution order for the results root:
+#   1. CS659_RESULTS_DIR env var (set by the pod orchestrator before spawning us)
+#   2. /workspace/results (pod-side default — analysis runs ON the pod)
+#   3. <repo_root>/results (laptop-side default for ad-hoc local testing)
+#
+# The hardcoded `Path(__file__).parent.parent.parent / "results"` previously
+# used here resolved to `/results` on the pod (since /workspace/agents/
+# analysis_agent.py has only two parent dirs before /), which silently broke
+# every pod-side analysis run — the agent reported "no results directory found"
+# and analysis_report.md never made it into the Release.
+def _resolve_results_root() -> Path:
+    env_dir = os.environ.get("CS659_RESULTS_DIR")
+    if env_dir:
+        return Path(env_dir)
+    pod_dir = Path("/workspace/results")
+    if pod_dir.exists():
+        return pod_dir
+    return Path(__file__).resolve().parent.parent.parent / "results"
 
 
 def _latest_run_dir() -> Path | None:
-    if not RESULTS_ROOT.exists():
+    root = _resolve_results_root()
+    if not root.exists():
         return None
+    # Try direct read of the root first — pod-side training writes
+    # metrics/plots/snapshots straight into /workspace/results/, not into a
+    # timestamped subdir. If we find any of the canonical files at that level,
+    # treat the root itself as the run dir.
+    canonical = (
+        "hyperparameters_snapshot.json",
+        "metrics_train_val_test.json",
+        "split_summary.json",
+        "plant_classifier_deep_learning.tflite",
+    )
+    if any((root / n).exists() for n in canonical):
+        return root
+    # Otherwise fall back to the latest dated subdir (laptop-side layout).
     dirs = sorted(
-        (d for d in RESULTS_ROOT.iterdir() if d.is_dir()),
+        (d for d in root.iterdir() if d.is_dir()),
         key=lambda d: d.name,
         reverse=True,
     )
