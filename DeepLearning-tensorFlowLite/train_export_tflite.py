@@ -29,6 +29,7 @@ Class index order = sorted folder names (must match plant_labels.txt line order)
 from __future__ import annotations
 
 import argparse
+import json
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -383,13 +384,30 @@ def _log_dataset_steps(train_ds: tf.data.Dataset, val_ds: tf.data.Dataset, batch
         )
 
 
-def _resolve_metric_class_names(class_dirs: list[str], out_labels_path: Path) -> list[str]:
+def _resolve_metric_class_names(
+    class_dirs: list[str],
+    out_labels_path: Path,
+    data_dir: Optional[Path] = None,
+) -> list[str]:
     """
     Keep model/export label order unchanged, but use scientific names in metrics plots when available.
+
+    Resolution order:
+      1. ``plant_labels_scientific.txt`` (line-aligned with class_dirs, both 1081
+         in the committed snapshot). Skipped on count mismatch — common when the
+         pod's flatten produces a different subset than what the file was
+         generated against.
+      2. ``plantnet300K_species_id_2_name.json`` (the dataset's own id → name
+         mapping). Looked up per-id, so it works even when count doesn't match.
+         Searched in: data_dir.parent, data_dir.parent.parent, the script's
+         own directory, and out_labels_path.parent.
+      3. Raw numeric ids — produces unreadable plots labeled "1355868" /
+         "1355920" etc., the failure mode this docstring is here to prevent.
     """
     if not class_dirs or not all(name.isdigit() for name in class_dirs):
         return class_dirs
 
+    # Tier 1: line-aligned scientific names file.
     candidates = [
         out_labels_path.resolve().parent / "plant_labels_scientific.txt",
         Path("plant_labels_scientific.txt").resolve(),
@@ -403,8 +421,45 @@ def _resolve_metric_class_names(class_dirs: list[str], out_labels_path: Path) ->
             return sci
         _log(
             f"Found {cand} but line count ({len(sci)}) != num_classes ({len(class_dirs)}); "
-            "keeping numeric IDs for metrics."
+            "trying per-id JSON lookup."
         )
+
+    # Tier 2: per-id lookup via PlantNet's id→name JSON. Survives count
+    # mismatches that the line-aligned file can't, because we look up each
+    # numeric id individually.
+    json_candidates: list[Path] = []
+    if data_dir is not None:
+        json_candidates += [
+            data_dir.parent / "plantnet_300K" / "plantnet300K_species_id_2_name.json",
+            data_dir.parent / "plantnet300K_species_id_2_name.json",
+            data_dir.parent.parent / "plantnet_300K" / "plantnet300K_species_id_2_name.json",
+        ]
+    json_candidates += [
+        out_labels_path.resolve().parent / "plantnet300K_species_id_2_name.json",
+        Path(__file__).resolve().parent / "plantnet300K_species_id_2_name.json",
+        Path("/workspace/plantnet_300K/plantnet300K_species_id_2_name.json"),
+    ]
+    for cand in json_candidates:
+        if not cand.is_file():
+            continue
+        try:
+            mapping = json.loads(cand.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as exc:
+            _log(f"Could not parse {cand}: {exc}")
+            continue
+        if not isinstance(mapping, dict):
+            continue
+        resolved = [str(mapping.get(sid, sid)) for sid in class_dirs]
+        hits = sum(1 for sid, name in zip(class_dirs, resolved) if name != sid)
+        _log(f"Resolved {hits}/{len(class_dirs)} species names via {cand}")
+        if hits > 0:
+            return resolved
+
+    _log(
+        "No species-name source found — metric plots will keep numeric ids. "
+        "Either commit plant_labels_scientific.txt with a matching line count, or "
+        "make plantnet300K_species_id_2_name.json reachable from data_dir.parent."
+    )
     return class_dirs
 
 
@@ -551,7 +606,7 @@ def main() -> None:
         )
     args.out_labels.write_text("\n".join(class_dirs) + "\n", encoding="utf-8")
     _log(f"Wrote {args.out_labels} ({num_classes} classes, sorted folder names)")
-    metric_class_names = _resolve_metric_class_names(class_dirs, args.out_labels)
+    metric_class_names = _resolve_metric_class_names(class_dirs, args.out_labels, data_dir=data_dir)
 
     base_log_dir: Optional[Path] = None
     if not args.no_metric_logs:
