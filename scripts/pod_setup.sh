@@ -84,6 +84,34 @@ apt-get update -qq
 apt-get install -y -qq rsync wget unzip git
 # screen was installed by the bootstrap before we got here.
 
+# ── 0b. Bump sshd connection limits ───────────────────────────────────────────
+# Default sshd MaxStartups is 10:30:60 — once 10 unauthenticated connections
+# are in flight, sshd starts dropping new ones with "kex_exchange_identification:
+# Connection reset by peer". The dashboard's pod-logs endpoint fanning out
+# multiple SSH calls + the user attaching their own terminal hits this every
+# time. Drop a config snippet that bumps the cap and reload sshd. Idempotent
+# (we overwrite the same file every run).
+SSHD_DROPIN=/etc/ssh/sshd_config.d/99-cs659.conf
+if [ -d /etc/ssh/sshd_config.d ]; then
+  cat > "$SSHD_DROPIN" <<'EOF'
+# Raised by CS659 pod_setup.sh — multi-connection dashboard polling otherwise
+# trips sshd's MaxStartups throttle and locks the user out mid-training.
+MaxStartups 100:30:200
+MaxSessions 50
+EOF
+  # Reload sshd if it's running. service/systemctl both exist on RunPod images;
+  # we try systemctl first and fall back. Failure is non-fatal — old limits
+  # still beat killing the pod.
+  if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet ssh 2>/dev/null; then
+    systemctl reload ssh 2>/dev/null || systemctl restart ssh 2>/dev/null || true
+  elif command -v service >/dev/null 2>&1; then
+    service ssh reload 2>/dev/null || service ssh restart 2>/dev/null || true
+  fi
+  log "sshd MaxStartups raised to 100:30:200 (drop-in: $SSHD_DROPIN)"
+else
+  log "WARNING: /etc/ssh/sshd_config.d not present — leaving sshd defaults (connection resets likely under load)"
+fi
+
 # ── 1+2. Download + unzip PlantNet-300K (idempotent) ──────────────────────────
 # Skipped on restart-training when the dataset directory is already present.
 # Saves ~15 minutes of wget when the user clicks "Restart training on same pod".
