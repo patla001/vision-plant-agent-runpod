@@ -136,6 +136,7 @@ REQUIRED_ARTIFACTS: tuple[str, ...] = (
     "hyperparameters_snapshot.json",
     "metrics_train_val_test.json",
     "split_summary.json",
+    "loss_vs_epoch.png",
     "analysis_report.md",
     "training.log",
     "orchestrator.log",
