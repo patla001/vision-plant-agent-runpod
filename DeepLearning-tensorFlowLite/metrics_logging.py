@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import csv
 import json
+import re
 from pathlib import Path
 from typing import Any, Optional
 
@@ -99,6 +100,42 @@ def compute_sklearn_metrics(
     return out
 
 
+# Strip trailing botanical authority from a scientific name. The two alternatives
+# handle both parenthesized authorities ("(L.) L'Hér.") which are followed by an
+# unparenthesized author, and trailing single/multi-word author abbreviations
+# ("L.", "Scop.", "L'Hér."). Examples:
+#   "Pelargonium capitatum (L.) L'Hér." → "Pelargonium capitatum"
+#   "Lactuca virosa L."                 → "Lactuca virosa"
+#   "Cirsium arvense (L.) Scop."        → "Cirsium arvense"
+_AUTHORITY_RE = re.compile(r"\s*\(.*?\)\s*.*$|\s+[A-Z][\w'.\-]+(?:\s+[A-Z][\w'.\-]+)*\.?\s*$")
+
+
+def _short_label(name: str, max_len: int = 22) -> str:
+    """Compress a scientific name into a tick-friendly short form.
+
+    Takes "Pelargonium capitatum (L.) L'Hér." → "P. capitatum"
+          "Lactuca virosa L."                → "L. virosa"
+          "Cirsium arvense (L.) Scop."       → "C. arvense"
+    Numeric ids (e.g. raw PlantNet "1355868") and single-word names are
+    returned unchanged so we don't mangle anything that wasn't a binomial
+    in the first place. Fallback: hard-truncate to ``max_len`` chars.
+    The previous implementation chopped at 14 chars regardless, producing
+    "Pelargonium ca" / "Cirsium arven" / "Linaria vulga" — which made the
+    confusion matrix and ROC plots harder to read than the numeric IDs.
+    """
+    n = name.strip()
+    if not n or n.isdigit():
+        return n
+    parts = n.split()
+    if len(parts) >= 2 and parts[0][:1].isupper() and parts[1][:1].islower():
+        short = f"{parts[0][0]}. {parts[1]}"
+        if len(short) <= max_len:
+            return short
+    if len(n) <= max_len:
+        return n
+    return n[:max_len].rstrip() + "…"
+
+
 def plot_confusion_and_correlation(
     y_true: np.ndarray,
     y_pred: np.ndarray,
@@ -116,7 +153,7 @@ def plot_confusion_and_correlation(
     im = ax.imshow(cm_norm[:kcm, :kcm], interpolation="nearest", cmap="Blues", vmin=0, vmax=1)
     ax.set_title("Normalized confusion matrix (rows sum to 1; true=row, pred=col)")
     if class_names and len(class_names) == num_classes:
-        tick = [class_names[i][:14] for i in range(kcm)]
+        tick = [_short_label(class_names[i]) for i in range(kcm)]
     else:
         tick = [str(i) for i in range(kcm)]
     ax.set_xticks(np.arange(kcm))
@@ -145,7 +182,7 @@ def plot_confusion_and_correlation(
         im = ax.imshow(corr[:k, :k], interpolation="nearest", cmap="coolwarm", vmin=-1, vmax=1)
         ax.set_title("Correlation across rows of normalized confusion (similar mistake structure)")
         if class_names and len(class_names) == num_classes:
-            tick = [class_names[i][:14] for i in range(k)]
+            tick = [_short_label(class_names[i]) for i in range(k)]
         else:
             tick = [str(i) for i in range(k)]
         ax.set_xticks(np.arange(k))
@@ -197,7 +234,11 @@ def plot_multiclass_roc(
             fpr_c, tpr_c, _ = roc_curve(y_bin, y_prob[:, c])
             auc_c = float(auc(fpr_c, tpr_c))
             if class_names and len(class_names) == num_classes:
-                class_label = class_names[c]
+                # Strip the trailing botanical authority ("L.", "(L.) L'Hér.",
+                # "Scop.", etc.) so legend entries stay scannable. Falls back
+                # to the raw name when the regex strip doesn't apply (e.g.
+                # the name is already short, or the input is a numeric id).
+                class_label = _AUTHORITY_RE.sub("", class_names[c]).strip() or class_names[c]
             else:
                 class_label = f"class {c}"
             ax.plot(fpr_c, tpr_c, alpha=0.35, label=f"{class_label} (AUC≈{auc_c:.2f})")
