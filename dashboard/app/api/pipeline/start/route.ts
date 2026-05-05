@@ -58,6 +58,46 @@ function sanitizeHyperparameters(raw: unknown): Record<string, number> | null {
   return Object.keys(out).length > 0 ? out : null;
 }
 
+/**
+ * Last-resort lookup of the AI hyperparameter suggestion when the dashboard
+ * forgot to (or couldn't) include it in the request body. Mirrors the
+ * resolution order in /api/results/suggested-hyperparameters:
+ *   1. results/last_suggested_hyperparameters.json (top-level convenience copy)
+ *   2. results/<latest run dir>/suggested_hyperparameters.json
+ *
+ * Without this fallback, hp_mode="ai" + missing body.hyperparameters silently
+ * ran with defaults — the same overfitting bug the user kept hitting because
+ * the dashboard's aiSuggestion fetch returned 404 right after a failed run
+ * (the previous run never produced a suggester JSON to read from).
+ */
+function loadLastAiSuggestion(): Record<string, number> | null {
+  const top = path.join(RESULTS, "last_suggested_hyperparameters.json");
+  if (fs.existsSync(top)) {
+    try {
+      const body = JSON.parse(fs.readFileSync(top, "utf8"));
+      const sanitized = sanitizeHyperparameters(body?.suggested_hyperparameters);
+      if (sanitized) return sanitized;
+    } catch { /* fall through to subdir scan */ }
+  }
+  if (!fs.existsSync(RESULTS)) return null;
+  const subs = fs.readdirSync(RESULTS)
+    .filter((d) => {
+      try { return fs.statSync(path.join(RESULTS, d)).isDirectory(); } catch { return false; }
+    })
+    .sort()
+    .reverse();
+  for (const sub of subs) {
+    const p = path.join(RESULTS, sub, "suggested_hyperparameters.json");
+    if (!fs.existsSync(p)) continue;
+    try {
+      const body = JSON.parse(fs.readFileSync(p, "utf8"));
+      const sanitized = sanitizeHyperparameters(body?.suggested_hyperparameters);
+      if (sanitized) return sanitized;
+    } catch { /* try next */ }
+  }
+  return null;
+}
+
 export async function POST(req: NextRequest) {
   // Optional body: {
   //   color_correct?: "none" | "gray_world" | "max_rgb",
@@ -85,6 +125,21 @@ export async function POST(req: NextRequest) {
     const m = body?.hp_mode;
     if (m === "default" || m === "ai" || m === "manual") hpMode = m;
   } catch { /* no body — fine */ }
+
+  // AI mode contract: actually use the AI suggestion. If the dashboard
+  // didn't include it in the body (timing race after a failed run, stale
+  // state, etc.), pull it off disk. If neither path produces a suggestion,
+  // refuse the request — silently falling back to defaults made the user
+  // think AI mode was running when it wasn't, which produced the same
+  // overfitting again and again.
+  if (hpMode === "ai" && !hyperparameters) {
+    hyperparameters = loadLastAiSuggestion();
+    if (!hyperparameters) {
+      return NextResponse.json({
+        error: "AI mode selected but no AI hyperparameter suggestion is available. Run a Default training first so the suggester can produce one, or switch to Default/Manual mode.",
+      }, { status: 400 });
+    }
+  }
 
   // Verify Python is callable before doing anything else
   const pythonBin = resolvePython();
