@@ -74,7 +74,14 @@ export async function POST() {
   // screen to mirror its pty output to setup.log so the dashboard's
   // pod-logs route can tail live progress (the outer redirect only
   // catches screen's startup errors).
+  // RUNPOD_POD_ID is required by pod_orchestrator.self_terminate AND by
+  // pod_setup.sh's EXIT-trap safety net. The variable is set by RunPod's
+  // container init but does NOT propagate into SSH sessions, so we have to
+  // pass it through the screen's env explicitly. Without this, restarting
+  // training on a pod that's idle works fine, but the pod will fail to
+  // self-terminate when the run finishes — and bill until manually killed.
   const ccExport = colorCorrect ? `COLOR_CORRECT=${colorCorrect} ` : "";
+  const podIdExport = `RUNPOD_POD_ID=${podId} `;
   const remoteCmd = [
     "set -e",
     "screen -S cs659 -X quit 2>/dev/null || true",
@@ -82,7 +89,7 @@ export async function POST() {
     "rm -rf /workspace/results/* 2>/dev/null || true",
     "rm -f /workspace/setup.log",
     "chmod +x /workspace/pod_setup.sh",
-    `( setsid env RUN_TAG=${newRunTag} ${ccExport}` +
+    `( setsid env RUN_TAG=${newRunTag} ${ccExport}${podIdExport}` +
       "  screen -dmS cs659 -L -Logfile /workspace/setup.log " +
       "  bash /workspace/pod_setup.sh " +
       "  > /dev/null 2>&1 < /dev/null )",
