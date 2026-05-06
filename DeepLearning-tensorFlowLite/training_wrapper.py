@@ -71,8 +71,14 @@ def main() -> None:
         "--data_dir",   str(args.data_dir),
         "--log_dir",    str(args.result_dir),
         "--out_tflite", str(tflite_out),
-        # All other hyperparameter defaults are read from model_hyperparameters.json
-        # by train_export_tflite.py automatically via experiment_config.merge_config_into_argparse_defaults
+        # Pass --config EXPLICITLY. train_export_tflite.py's --config default
+        # is None, which silently leaves file_defaults={} and falls through
+        # to every hyperparameter's hardcoded fallback (epochs=25, lr=1e-4,
+        # dropout=0.2, …). pod_setup.sh's hyperparameter override step writes
+        # the manual / AI-suggested values into model_hyperparameters.json,
+        # but if we don't pass --config, train_export_tflite.py never reads
+        # that file. Result: every "manual" or "AI" run silently used defaults.
+        "--config",     str(args.config),
     ]
     if args.color_correct:
         cmd += ["--color_correct", args.color_correct]
