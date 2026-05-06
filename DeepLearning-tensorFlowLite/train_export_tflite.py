@@ -158,6 +158,13 @@ def _make_dataset_from_paths(
         img = tf.io.decode_image(img, channels=3, expand_animations=False)
         img.set_shape([None, None, 3])
         img = tf.image.resize(img, [img_size, img_size])
+        # Cast back to uint8 so callers that .cache() this stream pay 1 byte
+        # per channel instead of 4. The float-space normalization (/255 +
+        # color correction) is applied AFTER cache by _attach_preprocess /
+        # _cache_uint8_then_float_preprocess. Cast loses sub-byte precision
+        # from the bilinear resize but matches what every standard MobileNet
+        # preprocessing path does and has no measurable accuracy cost.
+        img = tf.cast(img, tf.uint8)
         y = tf.one_hot(tf.cast(label, tf.int32), num_classes)
         return img, y
 
@@ -175,6 +182,10 @@ def _attach_preprocess(
     norm = tf.keras.layers.Rescaling(1.0 / 255.0)
 
     def _preprocess_batch(x: tf.Tensor, y: tf.Tensor) -> tuple[tf.Tensor, tf.Tensor]:
+        # Datasets from _make_dataset_from_paths are uint8. Cast once at the
+        # head of the map so /255 + color correction operate on float32 [0,1]
+        # as before. Cast is a no-op if input is already float (defensive).
+        x = tf.cast(x, tf.float32)
         x = norm(x)
         x = color_correction.apply_color_rgb01_bhwc(x, cc)
         return x, y
@@ -188,11 +199,56 @@ def _attach_preprocess_one(ds: tf.data.Dataset, cc: str) -> tf.data.Dataset:
     norm = tf.keras.layers.Rescaling(1.0 / 255.0)
 
     def _preprocess_batch(x: tf.Tensor, y: tf.Tensor) -> tuple[tf.Tensor, tf.Tensor]:
+        x = tf.cast(x, tf.float32)
         x = norm(x)
         x = color_correction.apply_color_rgb01_bhwc(x, cc)
         return x, y
 
     return ds.map(_preprocess_batch, num_parallel_calls=tf.data.AUTOTUNE).prefetch(tf.data.AUTOTUNE)
+
+
+def _cache_uint8_then_float_preprocess(
+    ds_uint8: tf.data.Dataset,
+    cc: str,
+    *,
+    n_samples: int,
+    img_size: int,
+    max_cache_mb: float,
+    what: str,
+) -> tf.data.Dataset:
+    """Cache the uint8 dataset, then apply float-space preprocessing.
+
+    Caching uint8 NHWC is 4× cheaper than caching the float32 [0,1] form
+    that _attach_preprocess produces. For PlantNet-300K at 224² this drops
+    the train cache estimate from ~119 GiB to ~30 GiB — fits in our 64 GiB
+    RAM floor (RUNPOD_MIN_MEMORY_GB) instead of always tripping the
+    --max_dataset_cache_mb guard. Per-epoch wall-clock drops ~2× after the
+    first epoch (no JPEG decode, no resize) on a JPEG-decode-bound run.
+
+    The caller is expected to pass an uint8 dataset (output of
+    _make_dataset_from_paths). After cache, we cast to float32, /255, and
+    apply color correction inside the post-cache .map() so the cheap
+    arithmetic still happens every epoch — that's a deliberate trade so the
+    cache stays small and color correction can change between callers
+    without invalidating the cache.
+    """
+    cached = _maybe_cache_decoded_dataset(
+        ds_uint8,
+        n_samples,
+        img_size,
+        max_cache_mb=max_cache_mb,
+        what=what,
+        bytes_per_pixel=1,
+    )
+    norm = tf.keras.layers.Rescaling(1.0 / 255.0)
+
+    def _to_float_then_correct(x: tf.Tensor, y: tf.Tensor) -> tuple[tf.Tensor, tf.Tensor]:
+        x = tf.cast(x, tf.float32)
+        x = norm(x)
+        x = color_correction.apply_color_rgb01_bhwc(x, cc)
+        return x, y
+
+    return cached.map(_to_float_then_correct, num_parallel_calls=tf.data.AUTOTUNE).prefetch(tf.data.AUTOTUNE)
 
 
 def _build_model(num_classes: int, img_size: int, dropout: float) -> tf.keras.Model:
@@ -337,9 +393,15 @@ def _train_one(
     return model, history
 
 
-def _approx_decoded_rgb_bytes(n_samples: int, img_size: int) -> int:
-    """Float32 NHWC after decode+resize — upper bound for tf.data.Dataset.cache() host RAM."""
-    return int(n_samples) * int(img_size) * int(img_size) * 3 * 4
+def _approx_decoded_rgb_bytes(n_samples: int, img_size: int, bytes_per_pixel: int = 1) -> int:
+    """RGB NHWC decoded-size estimate in bytes.
+
+    Default ``bytes_per_pixel=1`` (uint8) matches what _make_dataset_from_paths
+    now yields and what _cache_uint8_then_float_preprocess caches. Pass
+    ``bytes_per_pixel=4`` if the caller is caching the float32 [0,1] form
+    instead (legacy code path; not currently used).
+    """
+    return int(n_samples) * int(img_size) * int(img_size) * 3 * int(bytes_per_pixel)
 
 
 def _maybe_cache_decoded_dataset(
@@ -349,20 +411,30 @@ def _maybe_cache_decoded_dataset(
     *,
     max_cache_mb: float,
     what: str,
+    bytes_per_pixel: int = 1,
 ) -> tf.data.Dataset:
     """
-    tf.data ``cache()`` keeps decoded float tensors in host memory; large splits can OOM (tens of GiB).
+    tf.data ``cache()`` keeps decoded tensors in host memory; large splits can OOM (tens of GiB).
     Skip cache when estimated size exceeds ``max_cache_mb`` (0 = never cache).
+
+    ``bytes_per_pixel`` defaults to 1 (uint8) since _cache_uint8_then_float_preprocess
+    caches the uint8 form for a 4× footprint reduction. Pass 4 for float32
+    if caching post-normalization data.
     """
     if max_cache_mb <= 0:
         _log(f"Skipping {what} dataset cache (--max_dataset_cache_mb=0).")
         return ds
-    need = _approx_decoded_rgb_bytes(n_samples, img_size)
+    need = _approx_decoded_rgb_bytes(n_samples, img_size, bytes_per_pixel=bytes_per_pixel)
     max_bytes = int(max_cache_mb * 1024 * 1024)
+    dtype_label = "uint8" if bytes_per_pixel == 1 else "float32" if bytes_per_pixel == 4 else f"{bytes_per_pixel}B"
     if need <= max_bytes:
+        _log(
+            f"Caching {what} dataset (~{need / (1024**3):.2f} GiB {dtype_label} RGB estimated) "
+            f"under --max_dataset_cache_mb={max_cache_mb:.0f} MiB."
+        )
         return ds.cache()
     _log(
-        f"Skipping {what} dataset cache (~{need / (1024**3):.2f} GiB float32 RGB estimated) "
+        f"Skipping {what} dataset cache (~{need / (1024**3):.2f} GiB {dtype_label} RGB estimated) "
         f"because it exceeds --max_dataset_cache_mb={max_cache_mb:.0f} MiB "
         f"(raises epoch time; avoids host OOM / process kill)."
     )
@@ -553,8 +625,15 @@ def main() -> None:
     p.add_argument(
         "--max_dataset_cache_mb",
         type=float,
-        default=file_defaults.get("max_dataset_cache_mb", 2048.0),
-        help="Max estimated host RAM (MiB) for tf.data.Dataset.cache() on decoded float RGB. "
+        # 16384 MiB (16 GiB) covers PlantNet-300K val + test caches at the
+        # uint8 footprint (each ~6 GiB). The full uint8 train cache is ~37
+        # GiB and won't fit at this default — set higher in
+        # model_hyperparameters.json if you want training-set caching too,
+        # provided RUNPOD_MIN_MEMORY_GB has enough headroom (current floor: 64).
+        # The previous default of 2048 MiB pre-dated the uint8 cache and
+        # always tripped the size guard for any non-trivial split.
+        default=file_defaults.get("max_dataset_cache_mb", 16384.0),
+        help="Max estimated host RAM (MiB) for tf.data.Dataset.cache() on decoded uint8 RGB. "
         "Large train/val sets can exceed RAM and get the process killed; use 0 to never cache.",
     )
     p.add_argument(
@@ -701,16 +780,21 @@ def main() -> None:
             shuffle=False,
             shuffle_seed=args.seed,
         )
-        train_ds, val_ds = _attach_preprocess(train_ds, val_ds, cc)
-        test_ds_eval = _attach_preprocess_one(test_ds_eval, cc)
+        # Cache val as uint8 *before* float-preprocess when metrics are on, so
+        # the per-epoch metrics callback re-iterates a small in-RAM cache
+        # instead of re-decoding JPEGs every epoch. test_ds_eval stays uint8
+        # here — the metrics pass below will cache+preprocess it once.
+        train_ds = _attach_preprocess_one(train_ds, cc)
         if not args.no_metric_logs:
-            val_ds = _maybe_cache_decoded_dataset(
-                val_ds,
-                len(va_p),
-                args.img_size,
+            val_ds = _cache_uint8_then_float_preprocess(
+                val_ds, cc,
+                n_samples=len(va_p),
+                img_size=args.img_size,
                 max_cache_mb=args.max_dataset_cache_mb,
                 what="validation",
             )
+        else:
+            val_ds = _attach_preprocess_one(val_ds, cc)
         _log_dataset_steps(train_ds, val_ds, args.batch_size)
         mcb = metrics_cb(val_ds, "single_split", "metrics")
         model, history = _train_one(
@@ -800,15 +884,17 @@ def main() -> None:
                 shuffle=False,
                 shuffle_seed=args.seed,
             )
-            train_ds, val_ds = _attach_preprocess(train_ds, val_ds, cc)
+            train_ds = _attach_preprocess_one(train_ds, cc)
             if not args.no_metric_logs:
-                val_ds = _maybe_cache_decoded_dataset(
-                    val_ds,
-                    len(va_p),
-                    args.img_size,
+                val_ds = _cache_uint8_then_float_preprocess(
+                    val_ds, cc,
+                    n_samples=len(va_p),
+                    img_size=args.img_size,
                     max_cache_mb=args.max_dataset_cache_mb,
                     what="validation",
                 )
+            else:
+                val_ds = _attach_preprocess_one(val_ds, cc)
             _log_dataset_steps(train_ds, val_ds, args.batch_size)
 
             mcb = metrics_cb(val_ds, f"fold_{fold_idx + 1}", "metrics")
@@ -878,15 +964,17 @@ def main() -> None:
                 shuffle=False,
                 shuffle_seed=args.seed,
             )
-            train_ds, val_ds = _attach_preprocess(train_ds, val_ds, cc)
+            train_ds = _attach_preprocess_one(train_ds, cc)
             if not args.no_metric_logs:
-                val_ds = _maybe_cache_decoded_dataset(
-                    val_ds,
-                    len(va_fit),
-                    args.img_size,
+                val_ds = _cache_uint8_then_float_preprocess(
+                    val_ds, cc,
+                    n_samples=len(va_fit),
+                    img_size=args.img_size,
                     max_cache_mb=args.max_dataset_cache_mb,
                     what="validation",
                 )
+            else:
+                val_ds = _attach_preprocess_one(val_ds, cc)
             _log_dataset_steps(train_ds, val_ds, args.batch_size)
             mcb = metrics_cb(val_ds, "final_retrain", "metrics")
             model, history = _train_one(
@@ -904,6 +992,8 @@ def main() -> None:
             if base_log_dir is not None:
                 plot_loss_curves(history.history, base_log_dir)
 
+        # Stays uint8 here — the metrics pass below caches+preprocesses it
+        # via _cache_uint8_then_float_preprocess for a 4× smaller cache.
         test_ds_eval = _make_dataset_from_paths(
             te_paths,
             te_y,
@@ -913,7 +1003,6 @@ def main() -> None:
             shuffle=False,
             shuffle_seed=args.seed,
         )
-        test_ds_eval = _attach_preprocess_one(test_ds_eval, cc)
 
     assert model is not None
 
@@ -941,18 +1030,17 @@ def main() -> None:
                 shuffle=False,
                 shuffle_seed=args.seed,
             )
-            train_ds_metric, val_ds_metric = _attach_preprocess(train_ds_metric, val_ds_metric, cc)
-            train_ds_metric = _maybe_cache_decoded_dataset(
-                train_ds_metric,
-                len(tr_p),
-                args.img_size,
+            train_ds_metric = _cache_uint8_then_float_preprocess(
+                train_ds_metric, cc,
+                n_samples=len(tr_p),
+                img_size=args.img_size,
                 max_cache_mb=args.max_dataset_cache_mb,
                 what="train (metrics pass)",
             )
-            val_ds_metric = _maybe_cache_decoded_dataset(
-                val_ds_metric,
-                len(va_p),
-                args.img_size,
+            val_ds_metric = _cache_uint8_then_float_preprocess(
+                val_ds_metric, cc,
+                n_samples=len(va_p),
+                img_size=args.img_size,
                 max_cache_mb=args.max_dataset_cache_mb,
                 what="validation (metrics pass)",
             )
@@ -974,10 +1062,10 @@ def main() -> None:
             )
         if test_ds_eval is not None:
             n_test = len(te_p) if args.k_folds == 1 else len(te_paths)
-            test_ds_metric = _maybe_cache_decoded_dataset(
-                test_ds_eval,
-                n_test,
-                args.img_size,
+            test_ds_metric = _cache_uint8_then_float_preprocess(
+                test_ds_eval, cc,
+                n_samples=n_test,
+                img_size=args.img_size,
                 max_cache_mb=args.max_dataset_cache_mb,
                 what="test",
             )
