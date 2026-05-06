@@ -537,7 +537,19 @@ def _resolve_metric_class_names(
 
 def main() -> None:
     pre = argparse.ArgumentParser(add_help=False)
-    pre.add_argument("--config", type=Path, default=None, help="JSON (see model_hyperparameters.json)")
+    # Default to the sibling model_hyperparameters.json so a direct
+    # `python train_export_tflite.py --data_dir ...` invocation also picks up
+    # JSON overrides (manual / AI suggestions written into the JSON by the
+    # pipeline). The previous default of None silently dropped every
+    # JSON-driven override and let hardcoded fallbacks (epochs=25, lr=1e-4,
+    # dropout=0.2, …) take over — exactly what bit the 2026-05-06 manual run.
+    _default_config = Path(__file__).parent / "model_hyperparameters.json"
+    pre.add_argument(
+        "--config", type=Path,
+        default=_default_config if _default_config.exists() else None,
+        help="JSON (see model_hyperparameters.json). Defaults to the sibling "
+        "model_hyperparameters.json if present.",
+    )
     pre_args, _ = pre.parse_known_args()
 
     file_defaults: dict = {}
