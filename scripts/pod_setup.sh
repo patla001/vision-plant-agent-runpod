@@ -78,10 +78,13 @@ fi
 log "Run tag: $RUN_TAG"
 
 # ── 0. Install required system tools ──────────────────────────────────────────
-log "Installing system tools (rsync, wget, unzip, git) …"
+# aria2 is included for parallel-connection dataset download — see Stage 1+2.
+# Zenodo's per-connection throttling has produced 60 KB/s downloads (5+ day
+# ETA) in the past; aria2c with 16 parallel ranges bypasses it cleanly.
+log "Installing system tools (rsync, wget, unzip, git, aria2) …"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-apt-get install -y -qq rsync wget unzip git
+apt-get install -y -qq rsync wget unzip git aria2
 # screen was installed by the bootstrap before we got here.
 
 # ── 0b. Bump sshd connection limits ───────────────────────────────────────────
@@ -116,10 +119,33 @@ fi
 # Skipped on restart-training when the dataset directory is already present.
 # Saves ~15 minutes of wget when the user clicks "Restart training on same pod".
 if [ ! -d "$DATA_DIR" ]; then
-  log "Downloading PlantNet-300K (31.7 GB) …"
-  wget -q --show-progress \
-    "https://zenodo.org/records/5645731/files/plantnet_300K.zip?download=1" \
-    -O "$DATA_ZIP"
+  log "Downloading PlantNet-300K (31.7 GB) via aria2c (16 parallel connections) …"
+  # aria2c flags chosen to defeat Zenodo's per-connection throttle:
+  #   --max-connection-per-server=16  : open 16 parallel TCP connections
+  #   --split=16                      : split file into 16 byte-ranges, one per conn
+  #   --min-split-size=10M            : don't sub-divide further
+  #   --max-tries=10 --retry-wait=15  : tolerate transient Zenodo 503s
+  #   --continue=true                 : resume on retry / restart-training
+  #   --console-log-level=warn        : keep setup.log readable
+  #   --summary-interval=30           : one progress line every 30s
+  # Falls back to wget if aria2c errors (e.g. apt missed the package).
+  if ! aria2c \
+        --max-connection-per-server=16 \
+        --split=16 \
+        --min-split-size=10M \
+        --max-tries=10 \
+        --retry-wait=15 \
+        --continue=true \
+        --console-log-level=warn \
+        --summary-interval=30 \
+        --dir="$WORKSPACE" \
+        --out="$(basename "$DATA_ZIP")" \
+        "https://zenodo.org/records/5645731/files/plantnet_300K.zip?download=1"; then
+    log "aria2c failed; falling back to wget single-connection download (slow path)"
+    wget -q --show-progress -c \
+      "https://zenodo.org/records/5645731/files/plantnet_300K.zip?download=1" \
+      -O "$DATA_ZIP"
+  fi
   log "Unzipping …"
   cd "$WORKSPACE"
   unzip -q "$DATA_ZIP"
