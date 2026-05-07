@@ -241,15 +241,17 @@ def make_executor(
                     "current_hyperparameters":  {},
                 }, indent=2) + "\n")
 
-            _log("PodOrchestrator", f"Creating Release {run_tag} on {owner}/{repo} ...")
-            release = github_release_tool.create_release(
+            # Use find_or_create_release so a prior partial run (Release
+            # exists from before a crash mid-upload) doesn't 422 the retry.
+            _log("PodOrchestrator", f"Creating or attaching Release {run_tag} on {owner}/{repo} ...")
+            release = github_release_tool.find_or_create_release(
                 owner=owner, repo=repo, tag=run_tag,
                 name=inputs["title"], body=inputs["body"],
                 token=gh_token,
             )
             release_id = release["id"]
             release_url = release["html_url"]
-            _log("PodOrchestrator", f"Release created: {release_url}")
+            _log("PodOrchestrator", f"Release ready: {release_url}")
 
             files = github_release_tool.collect_artifact_files(results_dir)
             _log("PodOrchestrator", f"Uploading {len(files)} artifacts:")
@@ -259,7 +261,13 @@ def make_executor(
                     _log("PodOrchestrator", f"  - {f.relative_to(results_dir)} ({size / 1e3:.1f} KB)")
                 except OSError:
                     _log("PodOrchestrator", f"  - {f} (stat failed)")
-            github_release_tool.upload_all(release_id, owner, repo, files, gh_token)
+            # Pass results_dir so upload_all can build path-prefixed names on
+            # filename collisions (per-split confusion matrix etc.) instead of
+            # 422'ing on the duplicate.
+            github_release_tool.upload_all(
+                release_id, owner, repo, files, gh_token,
+                results_dir=results_dir,
+            )
             _log("PodOrchestrator", "All artifacts uploaded.")
 
             # Persist the URL so the dashboard can link to it.
@@ -459,7 +467,10 @@ def _release_fallback_upload(args) -> None:
 
         files = github_release_tool.collect_artifact_files(args.results_dir)
         _log("PodOrchestrator", f"Fallback: uploading {len(files)} files ...")
-        github_release_tool.upload_all(rel["id"], owner, repo, files, gh_token)
+        github_release_tool.upload_all(
+            rel["id"], owner, repo, files, gh_token,
+            results_dir=args.results_dir,
+        )
 
         # Persist the URL so the dashboard's poll-pod / sync-release routes
         # find it the same way they would on the happy path.
@@ -486,14 +497,19 @@ def _emergency_cleanup(args) -> None:
     owner, repo = github_release_tool.resolve_owner_repo(repo_dir)
 
     try:
-        rel = github_release_tool.create_release(
+        # find_or_create so a re-entry of emergency cleanup (e.g. signal
+        # delivered twice during shutdown) doesn't 422 on the failed-tag.
+        rel = github_release_tool.find_or_create_release(
             owner=owner, repo=repo, tag=args.run_tag + "-failed",
             name=f"FAILED {args.run_tag}",
             body="Training did not complete successfully. Partial artifacts attached for debugging.",
             token=gh_token, prerelease=True,
         )
         files = github_release_tool.collect_artifact_files(args.results_dir)
-        github_release_tool.upload_all(rel["id"], owner, repo, files, gh_token)
+        github_release_tool.upload_all(
+            rel["id"], owner, repo, files, gh_token,
+            results_dir=args.results_dir,
+        )
     except Exception as exc:
         print(f"Emergency upload failed: {exc}", file=sys.stderr, flush=True)
 
